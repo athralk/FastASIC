@@ -1,7 +1,7 @@
-// One inverter: rise 18.779 + 5.6270 * 33.442 = 206.96 ps beats fall 13.315 + 3.3299 * 33.442 = 124.67 ps
+// One inverter: rise 19.589 + 2.7682 * 6.0 = 36.20 ps beats fall 19.701 + 2.2105 * 6.0 = 32.96 ps
 // expect: Critical path: a -> y (1 cell)
-// expect: data arrival time 206.96
-// expect: y ^ 206.96
+// expect: data arrival time 36.20
+// expect: y ^ 36.20
 module inverter_rc (input a, output y);
     assign y = ~a;
 endmodule

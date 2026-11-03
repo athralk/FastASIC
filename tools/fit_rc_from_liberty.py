@@ -10,8 +10,8 @@ which shows how much the RC model loses by ignoring input slew.
 These are the numbers in src/cell_library.cpp.
 
 usage: fit_rc_from_liberty.py <file.lib> <cell> [<cell> ...]
-  e.g. fit_rc_from_liberty.py sky130_fd_sc_hd__tt_025C_1v80.lib \\
-           sky130_fd_sc_hd__inv_1 sky130_fd_sc_hd__nand2_1
+  e.g. fit_rc_from_liberty.py sg13cmos5l_stdcell_typ_1p20V_25C.lib \\
+           sg13cmos5l_inv_1 sg13cmos5l_nand2_1
 """
 import re
 import sys

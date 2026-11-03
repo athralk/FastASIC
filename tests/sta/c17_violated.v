@@ -1,7 +1,7 @@
-// Required time = period - output delay = 300 - 50 = 250 ps; arrival 338.11 ps misses it
-// sta-args: --period 300 --output-delay 50
-// expect: data required time 250.00
-// expect: slack -88.11 (VIOLATED)
+// Required time = period - output delay = 200 - 50 = 150 ps; arrival 154.44 ps misses it
+// sta-args: --period 200 --output-delay 50
+// expect: data required time 150.00
+// expect: slack -4.44 (VIOLATED)
 module c17 (N1, N2, N3, N6, N7, N22, N23);
     input N1, N2, N3, N6, N7;
     output N22, N23;

@@ -1,6 +1,7 @@
 // Independent check of the STA engine: recomputes every arrival and required time by
 // enumerating paths explicitly (no topological order, no memoization) and compares the
-// results with analyzeTiming at every node and edge. Exponential, so small designs only.
+// results with analyzeTiming at every node and edge, at every corner. Exponential, so small
+// designs only.
 //
 // usage: sta_bruteforce <design.v> [<design.v> ...]    exit 0 when everything matches
 #include "../include/elaborator.hpp"
@@ -29,16 +30,17 @@ bool isWire(GateType type) {
 class BruteForce {
     const TimingReport& report;
     const TimingConstraints& constraints;
+    Corner corner;
     std::set<const GateNode*> roots;
 
     double arcDelay(const GateNode* node, size_t pin, int edge) const {
-        const RcArc& arc = cellFor(node->type).arcs[pin];
+        const RcArc& arc = cellFor(node->type, corner).arcs[pin];
         return arc.intrinsic_ps[edge] + arc.r_kohm[edge] * report.timing.at(node).load_ff;
     }
 
 public:
-    BruteForce(const GateForest& forest, const TimingReport& r, const TimingConstraints& c)
-        : report(r), constraints(c) {
+    BruteForce(const GateForest& forest, const TimingReport& r, const TimingConstraints& c, Corner k)
+        : report(r), constraints(c), corner(k) {
         for (const auto& root : forest) roots.insert(root.get());
     }
 
@@ -73,7 +75,7 @@ public:
     }
 };
 
-bool checkDesign(const std::string& path) {
+bool checkCorner(const std::string& path, Corner corner) {
     // Unusual constraints so input delay, output delay and period all show up in the numbers
     TimingConstraints constraints;
     constraints.clock_period_ps = 900;
@@ -83,8 +85,8 @@ bool checkDesign(const std::string& path) {
     VerilogParser parser(VerilogLexer(readVerilogFile(path)).tokenize());
     Design design = elaborate(parser.parse());
     GateForest forest = NetlistOptimizer::optimize(TechnologyMapper::mapToNandInverter(design.forest));
-    TimingReport report = analyzeTiming(forest, constraints, DelayModel::RC);
-    BruteForce brute(forest, report, constraints);
+    TimingReport report = analyzeTiming(forest, constraints, DelayModel::RC, corner);
+    BruteForce brute(forest, report, constraints, corner);
 
     int pairs = 0, mismatches = 0;
     for (const auto& node : topologicalOrder(forest)) {
@@ -113,9 +115,15 @@ bool checkDesign(const std::string& path) {
         path_ok &= same(total, report.critical_path.back().arrival);
     }
 
-    std::cout << path << ": " << pairs << " node/edge pairs, " << mismatches << " mismatches, critical path "
+    std::cout << path << " (" << cornerName(corner) << "): " << pairs << " node/edge pairs, " << mismatches << " mismatches, critical path "
               << (path_ok ? "consistent" : "INCONSISTENT") << "\n";
     return mismatches == 0 && path_ok;
+}
+
+bool checkDesign(const std::string& path) {
+    bool ok = true;
+    for (Corner corner : {Corner::TYP, Corner::FAST, Corner::SLOW}) ok &= checkCorner(path, corner);
+    return ok;
 }
 
 } // namespace

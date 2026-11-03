@@ -25,6 +25,7 @@ class TimingAnalyzer {
     const GateForest& forest;
     const TimingConstraints& constraints;
     DelayModel model;
+    Corner corner;
     std::vector<std::shared_ptr<GateNode>> order;
     std::unordered_map<const GateNode*, NodeTiming> timing;
 
@@ -41,7 +42,7 @@ class TimingAnalyzer {
                 load += loadOf(fanout.get());
                 continue;
             }
-            const CellTiming& cell = cellFor(fanout->type);
+            const CellTiming& cell = cellFor(fanout->type, corner);
             for (size_t k = 0; k < fanout->inputs.size(); ++k) {
                 if (fanout->inputs[k].get() == node) load += cell.input_cap_ff[k];
             }
@@ -74,7 +75,7 @@ class TimingAnalyzer {
                     t.from_edge[e] = e;
                 }
             } else {
-                const CellTiming& cell = cellFor(node->type);
+                const CellTiming& cell = cellFor(node->type, corner);
                 for (Edge e : kEdges) {
                     // Both cells invert (negative unate): a rising output comes from a falling input
                     Edge in_edge = opposite(e);
@@ -111,7 +112,7 @@ class TimingAnalyzer {
                 NodeTiming& in = timing.at(node->inputs.at(0).get());
                 for (Edge e : kEdges) in.required[e] = std::min(in.required[e], t.required[e]);
             } else if (isCell(node->type)) {
-                const CellTiming& cell = cellFor(node->type);
+                const CellTiming& cell = cellFor(node->type, corner);
                 for (Edge e : kEdges) {
                     for (size_t k = 0; k < node->inputs.size(); ++k) {
                         NodeTiming& in = timing.at(node->inputs[k].get());
@@ -131,7 +132,7 @@ class TimingAnalyzer {
             node->required_time = std::min(t.required[RISE], t.required[FALL]);
             node->slack = std::min(t.slack(RISE), t.slack(FALL));
             if (isCell(node->type)) {
-                const CellTiming& cell = cellFor(node->type);
+                const CellTiming& cell = cellFor(node->type, corner);
                 node->mapped_cell_name = cell.name;
                 node->cell_area = cell.area_um2;
                 report.cell_count++;
@@ -169,8 +170,8 @@ class TimingAnalyzer {
     }
 
 public:
-    TimingAnalyzer(const GateForest& f, const TimingConstraints& c, DelayModel m)
-        : forest(f), constraints(c), model(m), order(topologicalOrder(f)) {}
+    TimingAnalyzer(const GateForest& f, const TimingConstraints& c, DelayModel m, Corner k)
+        : forest(f), constraints(c), model(m), corner(k), order(topologicalOrder(f)) {}
 
     TimingReport run() {
         propagateArrivals();
@@ -178,6 +179,7 @@ public:
 
         TimingReport report;
         report.model = model;
+        report.corner = corner;
         report.constraints = constraints;
         report.worst_slack = kInf;
         for (const auto& root : forest) report.outputs.push_back(root.get());
@@ -199,7 +201,7 @@ std::string shortCellName(const std::string& name) {
     return sep == std::string::npos ? name : name.substr(sep + 2);
 }
 
-std::string describeStage(const PathStage& stage) {
+std::string describeStage(const PathStage& stage, Corner corner) {
     const GateNode* node = stage.node;
     switch (node->type) {
     case GateType::INPUT:  return node->name + " (input)";
@@ -207,7 +209,7 @@ std::string describeStage(const PathStage& stage) {
     case GateType::ASSIGN:
     case GateType::BUF:    return node->name + " (wire)";
     default: {
-        const CellTiming& cell = cellFor(node->type);
+        const CellTiming& cell = cellFor(node->type, corner);
         return instanceName(*node) + " " + shortCellName(cell.name) + " " +
                cell.input_pins.at(stage.from_pin) + "->" + cell.output_pin;
     }
@@ -218,15 +220,17 @@ std::string describeStage(const PathStage& stage) {
 
 NodeTiming::NodeTiming() : arrival{-kInf, -kInf}, required{kInf, kInf} {}
 
-TimingReport analyzeTiming(const GateForest& forest, const TimingConstraints& constraints, DelayModel model) {
-    return TimingAnalyzer(forest, constraints, model).run();
+TimingReport analyzeTiming(const GateForest& forest, const TimingConstraints& constraints, DelayModel model,
+                           Corner corner) {
+    return TimingAnalyzer(forest, constraints, model, corner).run();
 }
 
 void printTimingReport(std::ostream& out, const TimingReport& report, size_t max_outputs) {
     const TimingConstraints& c = report.constraints;
     out << "\n=== Static Timing Analysis ===\n";
     if (report.model == DelayModel::RC) {
-        out << "Delay model: RC, t = R_eff*C_par + R_eff*C_load (sky130_fd_sc_hd, typical 25C 1.8V), times in ps\n";
+        out << "Delay model: RC, t = R_eff*C_par + R_eff*C_load (sg13cmos5l_stdcell, " << cornerName(report.corner)
+            << "), times in ps\n";
     } else {
         out << "Delay model: unit, every cell = 1 (the critical path delay is the logic depth)\n";
     }
@@ -248,7 +252,7 @@ void printTimingReport(std::ostream& out, const TimingReport& report, size_t max
     for (const PathStage& stage : path) {
         out << std::setw(12) << fixed2(stage.delay) << std::setw(12) << fixed2(stage.arrival)
             << std::setw(6) << (stage.edge == RISE ? "^" : "v") << std::setw(9) << fixed2(stage.load_ff)
-            << "  " << describeStage(stage) << "\n";
+            << "  " << describeStage(stage, report.corner) << "\n";
     }
     double arrival = path.back().arrival;
     out << "  data arrival time   " << std::setw(12) << fixed2(arrival) << "\n";

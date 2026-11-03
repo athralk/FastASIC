@@ -81,13 +81,14 @@ int usage(const char* program) {
               << "       " << program << " --equiv <first.v> <second.v>\n"
               << "  -q, --quiet           print gate counts and checks only, not the gate trees\n"
               << "  -o FILE               write the optimized NAND + INV netlist as structural Verilog\n"
-              << "  --sta                 static timing analysis of the optimized netlist (sky130_fd_sc_hd cells)\n"
-              << "Timing options (defaults follow OpenLane's sky130 flow):\n"
+              << "  --sta                 static timing analysis of the optimized netlist (IHP sg13cmos5l cells)\n"
+              << "Timing options:\n"
               << "  --delay-model rc|unit RC: t = R*C_par + R*C_load (default); unit: every cell = 1\n"
+              << "  --corner typ|fast|slow  typ 1.20V 25C (sign-off, default), fast 1.32V -40C, slow 1.08V 125C\n"
               << "  --period PS           clock period (default 10000)\n"
               << "  --input-delay PS      input arrival after the clock edge (default 0)\n"
               << "  --output-delay PS     output setup before the next edge (default 0)\n"
-              << "  --load FF             capacitance on every primary output (default 33.442)\n";
+              << "  --load FF             capacitance on every primary output (default 6.0, the PDK's LibreLane value)\n";
     return kExitError;
 }
 
@@ -107,6 +108,7 @@ int main(int argc, char* argv[]) {
     bool quiet = false;
     bool runSta = false;
     DelayModel delayModel = DelayModel::RC;
+    Corner corner = Corner::TYP;
     TimingConstraints constraints;
     std::string netlistPath;
     std::vector<std::string> files;
@@ -123,6 +125,13 @@ int main(int argc, char* argv[]) {
                 std::string name = argv[++i];
                 if (name == "rc") delayModel = DelayModel::RC;
                 else if (name == "unit") delayModel = DelayModel::UNIT;
+                else return usage(argv[0]);
+            }
+            else if (arg == "--corner" && hasValue) {
+                std::string name = argv[++i];
+                if (name == "typ") corner = Corner::TYP;
+                else if (name == "fast") corner = Corner::FAST;
+                else if (name == "slow") corner = Corner::SLOW;
                 else return usage(argv[0]);
             }
             else if (arg == "--period" && hasValue) constraints.clock_period_ps = numberArgument(arg, argv[++i]);
@@ -167,7 +176,7 @@ int main(int argc, char* argv[]) {
         }
 
         if (runSta) {
-            printTimingReport(std::cout, analyzeTiming(optimizedForest, constraints, delayModel));
+            printTimingReport(std::cout, analyzeTiming(optimizedForest, constraints, delayModel, corner));
         }
         return mappedOk && optimizedOk ? 0 : kExitNotEquivalent;
 

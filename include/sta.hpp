@@ -10,12 +10,13 @@ enum class DelayModel {
     RC,     // delay = R_eff * C_par + R_eff * C_load, ignores input slew
 };
 
-// Boundary conditions. The defaults follow OpenLane's sky130_fd_sc_hd flow.
+// Boundary conditions. The output load follows the PDK's LibreLane config for
+// sg13cmos5l_stdcell (libs.tech/librelane/sg13cmos5l_stdcell/config.tcl).
 struct TimingConstraints {
-    double clock_period_ps = 10000.0;   // CLOCK_PERIOD = 10 ns
+    double clock_period_ps = 10000.0;   // 10 ns (the PDK config does not set a clock)
     double input_delay_ps = 0.0;        // when the inputs switch, relative to the clock edge
     double output_delay_ps = 0.0;       // how early the outputs must settle before the next edge
-    double output_load_ff = 33.442;     // OUTPUT_CAP_LOAD: the input capacitance of an inv_16
+    double output_load_ff = 6.0;        // OUTPUT_CAP_LOAD
 };
 
 // Timing of one node's output net, kept separately for rising and falling transitions
@@ -43,6 +44,7 @@ struct PathStage {
 
 struct TimingReport {
     DelayModel model;
+    Corner corner;
     TimingConstraints constraints;
     std::unordered_map<const GateNode*, NodeTiming> timing;
     std::vector<const GateNode*> outputs;    // the forest roots, in order
@@ -54,6 +56,7 @@ struct TimingReport {
 
 // Static timing analysis of a mapped NAND2 + INV netlist. Also fills each node's
 // arrival_time / required_time / slack (worst edge) and mapped_cell_name / cell_area.
-TimingReport analyzeTiming(const GateForest& forest, const TimingConstraints& constraints, DelayModel model);
+TimingReport analyzeTiming(const GateForest& forest, const TimingConstraints& constraints, DelayModel model,
+                           Corner corner = Corner::TYP);
 
 void printTimingReport(std::ostream& out, const TimingReport& report, size_t max_outputs = 10);

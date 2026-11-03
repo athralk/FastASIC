@@ -1,11 +1,15 @@
-// ISCAS-85 c17. Critical path N6 -> N11 -> N16 -> N22, each internal net loading two NAND pins
-// (2.315 + 2.324 = 4.639 fF):
-//   (29.268 + 6.1195 * 4.639) + (23.156 + 5.0397 * 4.639) + (29.268 + 6.1195 * 33.442) = 338.11 ps
+// ISCAS-85 c17. The optimizer puts N3/N6 on N11's A/B pins, N2/N11 on N16's, N10/N16 on N22's,
+// so every internal net drives one A and one B pin: 2.886 + 2.978 = 5.864 fF.
+// Critical path N6 ^ -> N11 v -> N16 ^ -> N22 v:
+//   N11 fall via B: 32.346 + 4.0796 * 5.864 = 56.27 ps
+//   N16 rise via B: 25.111 + 2.7683 * 5.864 = 41.34 ps   (arrival 97.61)
+//   N22 fall via B: 32.346 + 4.0796 * 6.0   = 56.82 ps   (arrival 154.44)
+// N23's worst is a fall from N16 rising on pin A: 97.61 + 28.063 + 4.0814 * 6.0 = 150.16 ps
 // expect: Critical path: N6 -> N22 (3 cells)
-// expect: 57.66 57.66 ^ 4.64
-// expect: 46.54 104.19 v 4.64
-// expect: data arrival time 338.11
-// expect: N23 ^ 332.84 10000.00 9667.16
+// expect: 56.27 56.27 v 5.86
+// expect: 41.34 97.61 ^ 5.86
+// expect: data arrival time 154.44
+// expect: N23 v 150.16 10000.00 9849.84
 module c17 (N1, N2, N3, N6, N7, N22, N23);
     input N1, N2, N3, N6, N7;
     output N22, N23;
