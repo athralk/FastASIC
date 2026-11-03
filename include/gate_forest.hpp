@@ -47,3 +47,19 @@ struct GateNode : public std::enable_shared_from_this<GateNode> {
 };
 
 using GateForest = std::vector<std::shared_ptr<GateNode>>;
+
+// A module port as declared in the source, kept so a netlist can be written back
+// out with exactly the same interface (vector ports are bit-blasted in the forest)
+struct PortInfo {
+    std::string name;
+    bool is_input = true;
+    bool is_vector = false;
+    int msb = 0;
+    int lsb = 0;
+};
+
+struct Design {
+    std::string name;
+    std::vector<PortInfo> ports;
+    GateForest forest;   // one OUTPUT root per output bit, named like "y" or "y[3]"
+};

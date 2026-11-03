@@ -1,0 +1,4 @@
+# Build output
+output_test
+tests/sta_bruteforce
+*.o

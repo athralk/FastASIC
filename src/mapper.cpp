@@ -1,100 +1,97 @@
 #include "../include/mapper.hpp"
+#include "../include/netlist_utils.hpp"
+#include <initializer_list>
 #include <memory>
+#include <stdexcept>
+#include <unordered_map>
 
-// Recursive helper function to rewrite gates into NAND and NOT primitives
-std::shared_ptr<GateNode> canonicalizeNode(const std::shared_ptr<GateNode>& node, int& id_counter) {
-    if (!node) return nullptr;
+// Rewrites gates into NAND and NOT primitives.
+// Results are memoized per source node so shared logic is mapped once and stays shared;
+// without this, every reconvergent path would duplicate its whole fanin cone.
+class MapperPass {
+    int next_id;
+    std::unordered_map<const GateNode*, std::shared_ptr<GateNode>> memo;
 
-    // Pass through inputs/constants directly
-    if (node->type == GateType::INPUT || node->type == GateType::CONST0 || node->type == GateType::CONST1) {
-        return std::make_shared<GateNode>(id_counter++, node->type, node->name);
+    std::shared_ptr<GateNode> make(GateType type, const std::string& name,
+                                   std::initializer_list<std::shared_ptr<GateNode>> fanins) {
+        auto node = std::make_shared<GateNode>(next_id++, type, name);
+        for (const auto& fanin : fanins) node->addFanin(fanin);
+        return node;
     }
-
-    // Pass through structural roots (ASSIGN / OUTPUT)
-    if (node->type == GateType::ASSIGN || node->type == GateType::OUTPUT) {
-        auto newNode = std::make_shared<GateNode>(id_counter++, node->type, node->name);
-        if (!node->inputs.empty()) {
-            newNode->addFanin(canonicalizeNode(node->inputs[0], id_counter));
-        }
-        return newNode;
+    std::shared_ptr<GateNode> makeNot(const std::shared_ptr<GateNode>& a) {
+        return make(GateType::NOT, "not", {a});
     }
-
-    // Inverter remains an Inverter (NOT)
-    if (node->type == GateType::NOT) {
-        auto operand = canonicalizeNode(node->inputs[0], id_counter);
-        auto notNode = std::make_shared<GateNode>(id_counter++, GateType::NOT, "not");
-        if (operand) notNode->addFanin(operand);
-        return notNode;
+    std::shared_ptr<GateNode> makeNand(const std::shared_ptr<GateNode>& a, const std::shared_ptr<GateNode>& b) {
+        return make(GateType::NAND, "nand", {a, b});
     }
-
-    // Rewrite AND(A, B) into NOT(NAND(A, B))
-    if (node->type == GateType::AND) {
-        auto left = canonicalizeNode(node->inputs[0], id_counter);
-        auto right = canonicalizeNode(node->inputs[1], id_counter);
-
-        auto nandNode = std::make_shared<GateNode>(id_counter++, GateType::NAND, "nand");
-        if (left) nandNode->addFanin(left);
-        if (right) nandNode->addFanin(right);
-
-        auto notNode = std::make_shared<GateNode>(id_counter++, GateType::NOT, "not");
-        notNode->addFanin(nandNode);
-        return notNode;
-    }
-
-    // Rewrite OR(A, B) into NAND(NOT(A), NOT(B)) using De Morgan's Law
-    if (node->type == GateType::OR) {
-        auto left = canonicalizeNode(node->inputs[0], id_counter);
-        auto right = canonicalizeNode(node->inputs[1], id_counter);
-
-        auto notA = std::make_shared<GateNode>(id_counter++, GateType::NOT, "not");
-        if (left) notA->addFanin(left);
-
-        auto notB = std::make_shared<GateNode>(id_counter++, GateType::NOT, "not");
-        if (right) notB->addFanin(right);
-
-        auto nandNode = std::make_shared<GateNode>(id_counter++, GateType::NAND, "nand");
-        nandNode->addFanin(notA);
-        nandNode->addFanin(notB);
-
-        return nandNode;
-    }
-    if (node->type == GateType::XOR) {
-    auto A = canonicalizeNode(node->inputs[0], id_counter);
-    auto B = canonicalizeNode(node->inputs[1], id_counter);
 
     // 4-NAND implementation of XOR:
-    // T1 = NAND(A, B)
-    auto t1 = std::make_shared<GateNode>(id_counter++, GateType::NAND, "nand");
-    if (A) t1->addFanin(A);
-    if (B) t1->addFanin(B);
-
-    // T2 = NAND(A, T1)
-    auto t2 = std::make_shared<GateNode>(id_counter++, GateType::NAND, "nand");
-    if (A) t2->addFanin(A);
-    t2->addFanin(t1);
-
-    // T3 = NAND(B, T1)
-    auto t3 = std::make_shared<GateNode>(id_counter++, GateType::NAND, "nand");
-    if (B) t3->addFanin(B);
-    t3->addFanin(t1);
-
-    // Final = NAND(T2, T3)
-    auto xorNand = std::make_shared<GateNode>(id_counter++, GateType::NAND, "nand");
-    xorNand->addFanin(t2);
-    xorNand->addFanin(t3);
-
-    return xorNand;
+    // T1 = NAND(A, B), T2 = NAND(A, T1), T3 = NAND(B, T1), XOR = NAND(T2, T3)
+    std::shared_ptr<GateNode> makeXor(const std::shared_ptr<GateNode>& a, const std::shared_ptr<GateNode>& b) {
+        auto t1 = makeNand(a, b);
+        auto t2 = makeNand(a, t1);
+        auto t3 = makeNand(b, t1);
+        return makeNand(t2, t3);
     }
 
-    // Fallback for any other node type
-    return std::make_shared<GateNode>(id_counter++, node->type, node->name);
-}
+    std::shared_ptr<GateNode> rewrite(const std::shared_ptr<GateNode>& node) {
+        // Pass through inputs/constants directly
+        if (node->type == GateType::INPUT || node->type == GateType::CONST0 || node->type == GateType::CONST1) {
+            return std::make_shared<GateNode>(next_id++, node->type, node->name);
+        }
+
+        // Pass through structural nodes (ASSIGN / OUTPUT) so net names survive mapping
+        if (node->type == GateType::ASSIGN || node->type == GateType::OUTPUT) {
+            auto newNode = std::make_shared<GateNode>(next_id++, node->type, node->name);
+            if (!node->inputs.empty()) newNode->addFanin(map(node->inputs[0]));
+            return newNode;
+        }
+
+        auto operand = [&](size_t i) {
+            if (i >= node->inputs.size()) {
+                throw std::runtime_error(gateTypeName(node->type) + " gate is missing input " + std::to_string(i));
+            }
+            return map(node->inputs[i]);
+        };
+
+        switch (node->type) {
+        // A buffer is logically a wire
+        case GateType::BUF:  return operand(0);
+        // Inverter remains an Inverter (NOT)
+        case GateType::NOT:  return makeNot(operand(0));
+        case GateType::NAND: return makeNand(operand(0), operand(1));
+        // AND(A, B) -> NOT(NAND(A, B))
+        case GateType::AND:  return makeNot(makeNand(operand(0), operand(1)));
+        // OR(A, B) -> NAND(NOT(A), NOT(B)) using De Morgan's Law
+        case GateType::OR:   return makeNand(makeNot(operand(0)), makeNot(operand(1)));
+        // NOR(A, B) -> NOT(OR(A, B))
+        case GateType::NOR:  return makeNot(makeNand(makeNot(operand(0)), makeNot(operand(1))));
+        case GateType::XOR:  return makeXor(operand(0), operand(1));
+        // XNOR(A, B) -> NOT(XOR(A, B))
+        case GateType::XNOR: return makeNot(makeXor(operand(0), operand(1)));
+        default:
+            throw std::runtime_error("technology mapper does not support " + gateTypeName(node->type) + " gates yet");
+        }
+    }
+
+public:
+    explicit MapperPass(int start_id) : next_id(start_id) {}
+
+    std::shared_ptr<GateNode> map(const std::shared_ptr<GateNode>& node) {
+        if (!node) return nullptr;
+        auto it = memo.find(node.get());
+        if (it != memo.end()) return it->second;
+        auto mapped = rewrite(node);
+        memo[node.get()] = mapped;
+        return mapped;
+    }
+};
 
 GateForest TechnologyMapper::mapToNandInverter(const GateForest& forest) {
     GateForest mappedForest;
-    int id_counter = 5000; // Unique ID offset for mapped canonical nodes
+    MapperPass pass(5000); // Unique ID offset for mapped canonical nodes
     for (const auto& root : forest) {
-        mappedForest.push_back(canonicalizeNode(root, id_counter));
+        mappedForest.push_back(pass.map(root));
     }
     return mappedForest;
 }

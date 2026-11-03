@@ -3,8 +3,8 @@
 #include <vector>
 
 enum class TokenType {
-    MODULE, ENDMODULE, INPUT, OUTPUT, WIRE, ASSIGN,
-    IDENTIFIER, SYMBOL, END_OF_FILE
+    MODULE, ENDMODULE, INPUT, OUTPUT, WIRE, ASSIGN, PARAMETER, LOCALPARAM,
+    IDENTIFIER, NUMBER, SYMBOL, END_OF_FILE
 };
 
 struct Token {
@@ -18,9 +18,11 @@ class VerilogLexer {
     size_t pos = 0;
     size_t line = 1;
 
-    char peek() const;
+    char peek(size_t ahead = 0) const;
     char advance();
     void skipWhitespaceAndComments();
+    void skipDirective();
+    Token lexNumber();
 
 public:
     explicit VerilogLexer(std::string source);
