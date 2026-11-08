@@ -1,0 +1,3 @@
+module m (input [63:0] a, b, output [63:0] y);
+    assign y = a - ~b - 1;
+endmodule
