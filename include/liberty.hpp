@@ -61,6 +61,14 @@ struct LibPin {
     double max_cap = 0, max_transition = 0;       // fF, ps (0: not given)
     bool is_clock = false;
     std::string function;                         // Boolean function of an output, e.g. "!(A*B)"
+    std::string three_state;                      // tri-state enable condition (ebufn, einvn), empty for normal outputs
+};
+
+// bus(A_ADDR) { bus_type : A_9_0; ... }: one LibPin per bit, named A_ADDR[i]
+struct LibBus {
+    std::string name;
+    int from = 0, to = 0;    // bit_from / bit_to of the bus type ([9:0]: 9, 0)
+    std::vector<int> pins;   // pin indices in from..to order (most significant first for [9:0])
 };
 
 struct LibCell {
@@ -72,8 +80,16 @@ struct LibCell {
     bool is_sequential = false;   // has an ff or latch group
     bool is_latch = false;
     std::string ff_clocked_on, ff_next_state, ff_clear, ff_preset;
+    std::vector<LibBus> buses;
+    bool is_macro = false;        // a hard macro (memory() group): a black box with timing
+    // Fraction of a full rail-to-rail transition that this cell's slew numbers measure:
+    // (slew_upper - slew_lower threshold) / slew_derate_from_library of its library (0.6 for 20-80%).
+    // Slews are converted with it when a net connects cells from different libraries.
+    double slew_fraction = 0.6;
+    int address_width = 0, word_width = 0;
 
     int pinIndex(const std::string& name) const;
+    const LibBus* findBus(const std::string& name) const;
     int outputPin() const;   // the first output pin, or -1
 };
 
@@ -83,6 +99,7 @@ struct Library {
     double nom_voltage = 0, nom_temperature = 0;
     std::string leakage_unit;
     double time_unit_ps = 1000;   // the library's time unit (SDC files use it too)
+    double slew_fraction = 0.6;   // see LibCell::slew_fraction; SDC slews are in this library's terms
     double cap_unit_ff = 1000;    // the library's capacitance unit
     std::vector<LibCell> cells;
     std::unordered_map<std::string, int> cell_index;

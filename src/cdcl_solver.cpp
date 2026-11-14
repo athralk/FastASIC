@@ -144,6 +144,7 @@ class CdclSolver final : public SatSolver {
     std::vector<uint8_t> failed_flag;  // by literal after UNSATISFIABLE
     std::vector<Lit> failed_lits;
     bool ok = true;                    // false once the clauses alone are unsatisfiable
+    uint64_t conflict_limit = 0;       // per solve(); 0: none
     Stats counters;
 
     size_t varCount() const { return level.size(); }
@@ -554,9 +555,11 @@ public:
             if (propagate() != kNoReason) ok = false;
         }
         if (ok) {
+            uint64_t start = counters.conflicts;
             for (int restart = 0;; ++restart) {
                 result = search(static_cast<uint64_t>(luby(2, restart) * 100));
                 if (result != UNKNOWN) break;
+                if (conflict_limit && counters.conflicts - start >= conflict_limit) break;   // gave up
                 counters.restarts++;
                 if (counters.conflicts >= next_reduce) reduceDatabase();
             }
@@ -584,6 +587,7 @@ public:
     }
 
     Stats stats() const override { return counters; }
+    void setConflictLimit(uint64_t conflicts) override { conflict_limit = conflicts; }
 };
 
 } // namespace

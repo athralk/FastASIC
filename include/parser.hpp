@@ -21,7 +21,21 @@ class VerilogParser {
 
     void parseParameterAssignment();
     void parseDeclaration();
+    void parseRegDeclaration(bool is_integer);
     void parseAssign();
+    void parseAlways();
+    void parseInstances();
+    void parseModuleItem();
+    void parseFunction(bool is_task);
+    std::shared_ptr<Module> parseGenerateBody(std::string& label);
+    void parseGenerateFor();
+    void parseGenerateIf();
+    void parseGenerateCase();
+    std::vector<Connection> parseConnections(bool allow_empty);
+    Module parseModule();
+    StmtPtr parseStatement();
+    StmtPtr parseProceduralAssign(bool allow_nonblocking);
+    bool isKeyword(const std::string& word) const;
     void rejectUnsupportedKeyword(const Token& token) const;
 
     // Expressions: precedence climbing over the Verilog operator table, ?: lowest
@@ -34,5 +48,8 @@ class VerilogParser {
 
 public:
     explicit VerilogParser(std::vector<Token> t);
+    // Every module in the file, in source order
+    std::vector<Module> parseModules();
+    // The file's only module (throws if there are several)
     Module parse();
 };

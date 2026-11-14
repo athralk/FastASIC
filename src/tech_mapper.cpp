@@ -1,4 +1,5 @@
 #include "../include/tech_mapper.hpp"
+#include "../include/netlist_builder.hpp"
 #include "../include/netlist_utils.hpp"
 #include <algorithm>
 #include <cmath>
@@ -234,50 +235,32 @@ public:
             }
         }
 
-        MapResult result;
-        CellNetlist& nl = result.netlist;
-        nl.name = design.name;
-        nl.ports = design.ports;
-        std::unordered_map<std::string, int> input_net;
-        for (const auto& p : design.ports) {
-            int width = std::abs(p.msb - p.lsb) + 1;
-            for (int k = 0; k < width; ++k) {
-                int bit = p.msb >= p.lsb ? p.lsb + k : p.lsb - k;
-                std::string name = p.is_vector ? p.name + "[" + std::to_string(bit) + "]" : p.name;
-                if (p.is_input) {
-                    int net = nl.addNet(name);
-                    input_net[name] = net;
-                    nl.port_bits.push_back({name, true, net});
-                }
-            }
-        }
-
+        NetlistBuilder nb(design, lib);
         std::unordered_map<Node, int> net_of;
         std::function<int(Node)> emit = [&](Node v) -> int {
             if (v->type == GateType::CONST0) return CellNetlist::kConst0;
             if (v->type == GateType::CONST1) return CellNetlist::kConst1;
-            if (v->type == GateType::INPUT) return input_net.at(v->name);
+            if (v->type == GateType::INPUT) return nb.inputNet(v->name);
             auto it = net_of.find(v);
             if (it != net_of.end()) return it->second;
             const Match& m = best.at(v).match;
             const LibCell* cell = cells.at(m.cell);
-            CellNetlist::Instance inst;
-            inst.cell = cell;
-            inst.pin_net.assign(cell->pins.size(), -1);
             const auto& pins = pinOrder().at(m.cell);
-            for (size_t k = 0; k < m.leaves.size(); ++k) inst.pin_net[cell->pinIndex(pins[k])] = emit(m.leaves[k]);
-            inst.name = "_m" + std::to_string(nl.instances.size()) + "_";   // after the fanin cells are numbered
-            int net = nl.addNet("_n" + std::to_string(v->id) + "_");
+            std::vector<int> leaf_nets;
+            for (const Node leaf : m.leaves) leaf_nets.push_back(emit(leaf));   // fanin cells are numbered first
+            int net = nb.newNet("_n" + std::to_string(v->id) + "_");
+            auto& inst = nb.addCell(cell);
+            for (size_t k = 0; k < leaf_nets.size(); ++k) inst.pin_net[cell->pinIndex(pins[k])] = leaf_nets[k];
             inst.pin_net[cell->outputPin()] = net;
-            nl.instances.push_back(std::move(inst));
-            result.cell_counts[cell->name]++;
-            result.area += cell->area;
             return net_of[v] = net;
         };
-        for (const auto& root : forest) {
-            int net = emit(root->inputs.at(0).get());
-            nl.port_bits.push_back({root->name, false, net});
-        }
+        std::vector<std::pair<std::string, int>> roots;
+        for (const auto& root : forest) roots.emplace_back(root->name, emit(root->inputs.at(0).get()));
+        nb.finish(roots);
+        MapResult result;
+        result.netlist = std::move(nb.nl);
+        result.cell_counts = std::move(nb.cell_counts);
+        result.area = nb.area;
         return result;
     }
 };

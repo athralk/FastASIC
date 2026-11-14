@@ -11,7 +11,7 @@ bool isBaseChar(char c) { return std::string("bBoOdDhH").find(c) != std::string:
 
 // Multi-character operators, matched before single characters
 const char* const kLongSymbols[] = {
-    "~^", "^~", "~&", "~|", "&&", "||", "==", "!=", "<=", ">=", "<<", ">>", "+:", "-:",
+    ">>>", "<<<", "~^", "^~", "~&", "~|", "&&", "||", "==", "!=", "<=", ">=", "<<", ">>", "+:", "-:",
 };
 // '@' and '.' aren't used by any supported construct; lexing them lets the parser explain
 // what's unsupported (an always block, a module instance) instead of failing on the character
@@ -50,8 +50,8 @@ void VerilogLexer::skipWhitespaceAndComments() {
     }
 }
 
-// `timescale and friends only matter to simulators, so they are skipped.
-// Directives that change the source text (`define, `ifdef, `include) would need a preprocessor.
+// `timescale and friends only matter to simulators, so they are skipped. `define, `ifdef and
+// `include are handled by the preprocessor before lexing.
 void VerilogLexer::skipDirective() {
     advance();
     size_t start = pos;
@@ -98,8 +98,9 @@ std::vector<Token> VerilogLexer::tokenize() {
             continue;
         }
 
-        if (isAlpha(c)) {
+        if (isAlpha(c) || (c == '$' && isAlpha(peek(1)))) {   // identifiers and $system names
             size_t start = pos;
+            advance();
             while (isAlnum(peek()) || peek() == '$') advance();
             std::string word = src.substr(start, pos - start);
             TokenType type = TokenType::IDENTIFIER;
@@ -122,11 +123,13 @@ std::vector<Token> VerilogLexer::tokenize() {
 
         bool matched = false;
         for (const char* symbol : kLongSymbols) {
-            if (c == symbol[0] && peek(1) == symbol[1]) {
+            std::string sym(symbol);
+            bool hit = true;
+            for (size_t k = 0; k < sym.size(); ++k) hit &= peek(k) == sym[k];
+            if (hit) {
                 // ^~ and ~^ are the same operator; keep one spelling
-                std::string value = std::string(symbol) == "^~" ? "~^" : symbol;
-                tokens.push_back({TokenType::SYMBOL, value, line});
-                advance(); advance();
+                tokens.push_back({TokenType::SYMBOL, sym == "^~" ? "~^" : sym, line});
+                for (size_t k = 0; k < sym.size(); ++k) advance();
                 matched = true;
                 break;
             }

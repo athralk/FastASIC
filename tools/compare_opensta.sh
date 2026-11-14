@@ -4,6 +4,7 @@
 # plus WNS / TNS and the runtime of both tools.
 #
 # usage: tools/compare_opensta.sh <netlist.v> <constraints.sdc> [corner: typ|fast|slow]
+#        EXTRA_LIBS="sg13cmos5l_sram/lib/X.lib ..." adds libraries (paths under the PDK's libs.ref)
 set -euo pipefail
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
@@ -11,7 +12,9 @@ NETLIST=$(realpath "$1")
 SDC=$(realpath "$2")
 CORNER=${3:-typ}
 IMAGE=${OPENLANE_IMAGE:-ghcr.io/efabless/openlane2:2.3.10}
-PDK=${PDK_ROOT:-$HOME/ttsetup/pdk}/ihp-sg13cmos5l/libs.ref/sg13cmos5l_stdcell/lib
+PDK_DIR=${PDK_ROOT:-$HOME/ttsetup/pdk}
+REF=$PDK_DIR/ihp-sg13cmos5l/libs.ref
+PDK=$REF/sg13cmos5l_stdcell/lib
 case $CORNER in
     fast) LIBFILE=sg13cmos5l_stdcell_fast_1p32V_m40C.lib ;;
     slow) LIBFILE=sg13cmos5l_stdcell_slow_1p08V_125C.lib ;;
@@ -25,7 +28,8 @@ cp "$NETLIST" "$TMP/netlist.v"
 cp "$SDC" "$TMP/constraints.sdc"
 cat > "$TMP/run.tcl" <<EOF
 set t0 [clock milliseconds]
-read_liberty /lib/$LIBFILE
+read_liberty /pdk/ihp-sg13cmos5l/libs.ref/sg13cmos5l_stdcell/lib/$LIBFILE
+$(for l in ${EXTRA_LIBS:-}; do echo "read_liberty /pdk/ihp-sg13cmos5l/libs.ref/$l"; done)
 set t1 [clock milliseconds]
 read_verilog /w/netlist.v
 link_design $TOP
@@ -45,12 +49,15 @@ puts "TIME liberty [expr \$t1 - \$t0] netlist_sdc [expr \$t2 - \$t1] analysis [e
 EOF
 
 start=$(date +%s%N)
-docker run --rm -v "$TMP:/w" -v "$PDK:/lib:ro" "$IMAGE" sta -no_init -exit /w/run.tcl > "$TMP/opensta.out" 2>&1 || {
+# the whole PDK is mounted: sg13cmos5l_sram is a symlink into the sg13g2 PDK
+docker run --rm -v "$TMP:/w" -v "$PDK_DIR:/pdk:ro" "$IMAGE" sta -no_init -exit /w/run.tcl > "$TMP/opensta.out" 2>&1 || {
     cat "$TMP/opensta.out"; exit 2; }
 opensta_wall=$((($(date +%s%N) - start) / 1000000))
 
 start=$(date +%s%N)
-"$ROOT/lsta" -q -lib "$PDK/$LIBFILE" -sdc "$SDC" -endpoints "$TMP/lsta.ep" "$NETLIST" > "$TMP/lsta.out"
+LSTA_LIBS=(-lib "$PDK/$LIBFILE")
+for l in ${EXTRA_LIBS:-}; do LSTA_LIBS+=(-lib "$REF/$l"); done
+"$ROOT/lsta" -q "${LSTA_LIBS[@]}" -sdc "$SDC" -endpoints "$TMP/lsta.ep" "$NETLIST" > "$TMP/lsta.out"
 lsta_wall=$((($(date +%s%N) - start) / 1000000))
 
 # OpenSTA prints times in ns: convert to ps and compare endpoint by endpoint (worst over edges)

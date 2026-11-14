@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 # Regression suite:
-#   cases/        every design must parse, map and optimize with equivalence intact (exit 0)
+#   cases/, seq/, hier/, lang/  every design must parse, map and optimize with equivalence intact (exit 0);
+#                 lang/ covers the preprocessor, signed arithmetic, shifters, multipliers, casez/casex,
+#                 functions / tasks and generate;
+#                 seq/ holds sequential designs (registers, memories, always blocks), hier/
+#                 multi-module designs (instances, parameter overrides), flattened
 #   errors/       malformed designs must be rejected (exit 2) with the message named in
 #                 their "// expect-error: ..." header line
 #   equiv/pass/   x.a.v and x.b.v must be reported equivalent (exit 0)
@@ -11,7 +15,9 @@
 #   + the CDCL solver is fuzzed against brute force (sat_fuzz.cpp)
 #   + the STA engine is checked against brute-force path enumeration (sta_bruteforce.cpp)
 #   + if yosys is installed, every design is formally checked against Yosys (yosys_equiv.sh)
-#   + if the IHP sg13cmos5l PDK is installed: lsta against OpenSTA golden values (lsta_golden.sh),
+#   + if the IHP sg13cmos5l PDK is installed: hard-macro (SRAM) designs in macro/, SRAM inference
+#     in infer/ (co-simulated against the RTL with the PDK's SRAM model, cosim_sram.sh), lsta against
+#     OpenSTA golden values (lsta_golden.sh),
 #     tree-covering onto real cells (SAT-checked against the RTL), netlist write/read round trip
 set -u
 
@@ -39,7 +45,7 @@ check() {
 
 echo "Pipeline (parse -> map -> optimize, checked for equivalence):"
 check "example.v" 0 "" "$BIN" "$DIR/../example.v"
-for f in "$DIR"/cases/*.v; do
+for f in "$DIR"/cases/*.v "$DIR"/seq/*.v "$DIR"/hier/*.v "$DIR"/lang/*.v; do
     check "$(basename "$f")" 0 "" "$BIN" "$f"
 done
 
@@ -105,7 +111,8 @@ fi
 
 echo "Formal cross-check against Yosys (SAT proof that our netlist matches Yosys's reading of the RTL):"
 if command -v yosys > /dev/null; then
-    for f in "$DIR/../example.v" "$DIR"/cases/*.v; do
+    for f in "$DIR/../example.v" "$DIR"/cases/*.v "$DIR"/seq/*.v "$DIR"/hier/*.v "$DIR"/lang/*.v; do
+        if grep -q "yosys-equiv: skip" "$f"; then echo "  skip  $(basename "$f") (checked by co-simulation)"; continue; fi
         check "$(basename "$f")" 0 "" bash "$DIR/yosys_equiv.sh" "$BIN" "$f"
     done
 else
@@ -130,16 +137,73 @@ else
     echo "  skipped (IHP sg13cmos5l PDK not found at \$PDK_ROOT or ~/ttsetup/pdk)"
 fi
 
+echo "Hard macros (IHP SRAMs, found in the PDK by name):"
+if [ -f "$PDK_LIB" ]; then
+    for f in "$DIR"/macro/*.v; do
+        check "$(basename "$f") pipeline" 0 "original vs optimized: PASS" "$BIN" -q "$f"
+        check "$(basename "$f") --map (SAT-checked)" 0 "original vs cells: PASS" "$BIN" -q --map area "$f"
+        if command -v yosys > /dev/null; then
+            check "$(basename "$f") Yosys proof (macro stand-in model)" 0 "" bash "$DIR/yosys_equiv.sh" "$BIN" "$f"
+        fi
+    done
+    for f in "$DIR"/macro/errors/*.v; do
+        needle=$(sed -n 's|^// expect-error: ||p' "$f" | head -n 1)
+        check "$(basename "$f")" 2 "$needle" "$BIN" "$f"
+    done
+else
+    echo "  skipped (IHP PDK not found)"
+fi
+
+echo "SRAM inference (reg memories -> PDK SRAM macros, checked by co-simulation with IHP's model):"
+if [ -f "$PDK_LIB" ]; then
+    for f in "$DIR"/infer/*.v; do
+        note=$(sed -n 's|^// expect-note: ||p' "$f" | head -n 1)
+        check "$(basename "$f") decision" 0 "$note" "$BIN" -q "$f"
+        check "$(basename "$f") --map (SAT-checked)" 0 "original vs cells: PASS" "$BIN" -q --map area "$f"
+        if command -v iverilog > /dev/null && command -v yosys > /dev/null && grep -q -- "-> RM_" <<< "$note"; then
+            check "$(basename "$f") co-simulation vs RTL" 0 "PASS 4000 cycles" bash "$DIR/cosim_sram.sh" "$BIN" "$f"
+        fi
+    done
+    check "ram_1p.v --no-sram-infer keeps flip-flops" 0 "Registers: 8200 flip-flops" "$BIN" -q --no-sram-infer "$DIR/infer/ram_1p.v"
+    if command -v iverilog > /dev/null && command -v yosys > /dev/null; then
+        export COSIM_MUTATE='s/\.A_REN\([^)]*\)/.A_REN(1'"'"'b1)/'
+        check "co-simulation catches a planted bug (read enable forced high)" 1 "FAIL" bash "$DIR/cosim_sram.sh" "$BIN" "$DIR/infer/ram_1p.v"
+        unset COSIM_MUTATE
+    else
+        echo "  co-simulation skipped (needs iverilog and yosys)"
+    fi
+else
+    echo "  skipped (IHP PDK not found)"
+fi
+
 echo "Technology mapping onto sg13cmos5l cells (every result SAT-checked against the RTL):"
 if [ -f "$PDK_LIB" ]; then
-    for f in "$DIR/../example.v" "$DIR"/cases/*.v; do
+    for f in "$DIR/../example.v" "$DIR"/cases/*.v "$DIR"/seq/*.v "$DIR"/hier/*.v "$DIR"/lang/*.v; do
         for goal in area delay; do
             check "$(basename "$f") --map $goal" 0 "original vs cells: PASS" "$BIN" -q --map $goal "$f"
         done
     done
     check "adder8.v --sta --delay-model nldm" 0 "Summary (ps)" "$BIN" -q --sta --delay-model nldm "$DIR/cases/adder8.v"
+    check "counter.v --sta --delay-model nldm (register paths)" 0 "rising edge-triggered flip-flop" "$BIN" -q --sta --delay-model nldm "$DIR/seq/counter.v"
 else
     echo "  skipped (IHP sg13cmos5l PDK not found)"
+fi
+
+echo "Co-simulation against iverilog (RTL operators vs our netlist; exhaustive up to 16 input bits):"
+if command -v iverilog > /dev/null && command -v yosys > /dev/null; then
+    for f in "$DIR"/lang/*.v "$DIR"/cases/adder8.v "$DIR"/cases/compare12.v "$DIR"/cases/alu4.v; do
+        check "$(basename "$f")" 0 "PASS" bash "$DIR/cosim.sh" "$BIN" "$f" 20000
+    done
+    for style in brent-kung sklansky kogge-stone; do
+        for f in "$DIR"/lang/multipliers.v "$DIR"/lang/signed_math.v "$DIR"/cases/compare12.v; do
+            check "$(basename "$f") --adder $style" 0 "PASS" bash "$DIR/cosim.sh" "$BIN" "$f" 20000 --adder "$style"
+        done
+    done
+    export COSIM_MUTATE='0,/~\(/s//(/'
+    check "co-simulation catches a planted bug (an inversion removed)" 1 "FAIL" bash "$DIR/cosim.sh" "$BIN" "$DIR/lang/multipliers.v" 20000
+    unset COSIM_MUTATE
+else
+    echo "  skipped (needs iverilog and yosys)"
 fi
 
 echo

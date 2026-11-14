@@ -58,6 +58,12 @@ class Timer {
     std::vector<std::vector<Arc>> checks;          // by data node: from = clock pin node
     std::vector<int> order;
     std::vector<uint8_t> clock_net, fixed;
+    std::vector<uint8_t> clock_inverted;   // clock network node sees the inverted clock
+    // Each pin's slew is in its own library's terms (slew thresholds / derate). Where a net
+    // connects a driver and a load from different libraries the slew is converted by the ratio
+    // of their slew fractions, as OpenSTA's DelayCalcBase::thresholdAdjust does; ports use the
+    // main (first) library.
+    std::vector<double> slew_frac;
 
     // Timing state, indexed node * 2 + edge
     std::vector<double> arr_max, arr_min, slew_max, slew_min;
@@ -122,6 +128,10 @@ class Timer {
         }
         res.cells = nl.instances.size();
         res.nets = nl.netCount();
+        slew_frac.assign(nodes.size(), lib.slew_fraction);
+        for (size_t n = 0; n < nodes.size(); ++n) {
+            if (nodes[n].inst >= 0) slew_frac[n] = nl.instances[nodes[n].inst].cell->slew_fraction;
+        }
 
         size_t n_nodes = nodes.size();
         net_driver.assign(nl.netCount(), -1);
@@ -180,7 +190,6 @@ class Timer {
                 case TimingType::RISING_EDGE: case TimingType::FALLING_EDGE:
                     fanin[to].push_back({from, to, &arc});
                     fanout[from].push_back({from, to, &arc});
-                    if (arc.type == TimingType::FALLING_EDGE) res.warnings.push_back("falling-edge registers are timed as if launched at the rising edge");
                     break;
                 default:
                     if (isCheck(arc.type) && inst.pin_net[arc.to_pin] >= 0) checks[to].push_back({from, to, &arc});
@@ -224,6 +233,7 @@ class Timer {
 
         // Clock network: forward from the clock ports through combinational cells to register clock pins
         clock_net.assign(n_nodes, 0);
+        clock_inverted.assign(n_nodes, 0);
         std::vector<int> work;
         for (size_t p = 0; p < ports; ++p) {
             if (is_clock_source[p]) {
@@ -240,6 +250,7 @@ class Timer {
                 for (int load : net_loads[node.net]) {
                     if (!clock_net[load]) {
                         clock_net[load] = 1;
+                        clock_inverted[load] = clock_inverted[n];
                         work.push_back(load);
                     }
                 }
@@ -247,6 +258,8 @@ class Timer {
                 for (const Arc& a : fanout[n]) {   // through buffers / inverters / gates, not through registers
                     if (a.arc->type == TimingType::COMBINATIONAL && !clock_net[a.to]) {
                         clock_net[a.to] = 1;
+                        clock_inverted[a.to] = clock_inverted[n] ^ (a.arc->sense == TimingSense::NEGATIVE ? 1 : 0);
+                        if (a.arc->sense == TimingSense::NON) res.warnings.push_back("clock passes through a non-unate cell (" + nodeName(a.to) + ")");
                         work.push_back(a.to);
                     }
                 }
@@ -292,6 +305,35 @@ class Timer {
 
     double edgeTime(Edge e) const { return clock ? (e == RISE ? clock->rise : clock->fall) : 0.0; }
 
+    // Ideal time of clock edge e as seen at clock network node n (an inverter swaps the edges)
+    double phaseEdge(int n, Edge e) const {
+        bool inv = n >= 0 && clock_inverted[n];
+        return edgeTime(inv ? (e == RISE ? FALL : RISE) : e);
+    }
+
+    // Edge time that launched the path ending at timing index idx: the clock edge at the
+    // launching register's clock pin, or the clock's rising edge for input ports
+    double launchEdge(int idx, const std::vector<int>& pred) const {
+        int launch = launchClockPin(idx, pred);
+        if (launch < 0) return edgeTime(RISE);
+        return phaseEdge(launch / 2, static_cast<Edge>(launch % 2));
+    }
+
+    // Setup captures at the first capture edge after the launch edge, hold checks against the
+    // last one at or before it (so rising-to-falling paths get half a cycle)
+    double setupEdge(double capture0, double launch) const {
+        double t = capture0;
+        while (t <= launch + 1e-9) t += clock->period;
+        while (t - clock->period > launch + 1e-9) t -= clock->period;
+        return t;
+    }
+    double holdEdge(double capture0, double launch) const {
+        double t = capture0;
+        while (t > launch + 1e-9) t -= clock->period;
+        while (t + clock->period <= launch + 1e-9) t += clock->period;
+        return t;
+    }
+
     void initialize() {
         size_t n2 = nodes.size() * 2;
         arr_max.assign(n2, -kInf);
@@ -316,7 +358,7 @@ class Timer {
             fixed[n] = 1;
             // An ideal clock has the SDC clock transition everywhere; a propagated clock starts
             // with the port's input transition and gets real slews from the tree
-            double slew = clock->transition;
+            double slew = clock->transition;   // ideal clock slews are used as given, at every clock pin
             if (propagated) {
                 slew = 0;
                 for (const auto& t : sdc.input_transitions) {
@@ -324,7 +366,7 @@ class Timer {
                 }
             }
             for (Edge e : kEdges) {
-                double t = edgeTime(e) + (propagated ? 0 : clock->latency);
+                double t = (propagated ? edgeTime(e) : phaseEdge(static_cast<int>(n), e) + clock->latency);
                 set(static_cast<int>(n), e, t, t, slew, slew);
             }
         }
@@ -371,12 +413,13 @@ class Timer {
                 if (node.net <= CellNetlist::kConst1) continue;
                 int d = net_driver[node.net];
                 if (d < 0) continue;
+                double convert = slew_frac[n] / slew_frac[d];   // 1 unless the libraries differ
                 for (Edge e : kEdges) {   // ideal wire: same arrival and slew as the driver
                     size_t i = static_cast<size_t>(n) * 2 + e, j = static_cast<size_t>(d) * 2 + e;
                     arr_max[i] = arr_max[j];
                     arr_min[i] = arr_min[j];
-                    slew_max[i] = slew_max[j];
-                    slew_min[i] = slew_min[j];
+                    slew_max[i] = slew_max[j] * convert;
+                    slew_min[i] = slew_min[j] < kInf ? slew_min[j] * convert : kInf;
                     pred_max[i] = pred_min[i] = static_cast<int>(j);
                 }
                 continue;
@@ -450,7 +493,6 @@ class Timer {
     }
 
     void checkAll(std::vector<Candidate>& cands) {
-        double period = clock ? clock->period : 0;
         for (size_t n = 0; n < nodes.size(); ++n) {
             for (const Arc& a : checks[n]) {
                 const LibArc& arc = *a.arc;
@@ -475,23 +517,25 @@ class Timer {
                         args.constrained_transition = slew_max[di];
                         args.related_transition = slew_min[ci];
                         double margin = table.lookup(args);
-                        double edge = ce == RISE ? period + edgeTime(RISE) : edgeTime(FALL);
-                        double capture = arr_min[ci] - edgeTime(ce) + edge;
+                        double edge0 = phaseEdge(c, ce);
+                        double edge = setupEdge(edge0, launchEdge(static_cast<int>(di), pred_max));
+                        double capture = arr_min[ci] - edge0 + edge;
                         double credit = crpr(launchClockPin(static_cast<int>(di), pred_max), static_cast<int>(ci));
                         double required = capture - margin - clock->uncertainty_setup + credit;
                         cands.push_back({static_cast<int>(n), e, true, kind, arr_max[di], required, required - arr_max[di],
-                                         edge, arr_min[ci] - edgeTime(ce) + credit, margin, clock->uncertainty_setup});
+                                         edge, arr_min[ci] - edge0 + credit, margin, clock->uncertainty_setup});
                     } else {
                         if (arr_min[di] == kInf) continue;
                         args.constrained_transition = slew_min[di];
                         args.related_transition = slew_max[ci];
                         double margin = table.lookup(args);
-                        double edge = ce == RISE ? edgeTime(RISE) : edgeTime(FALL) - period;
-                        double capture = arr_max[ci] - edgeTime(ce) + edge;
+                        double edge0 = phaseEdge(c, ce);
+                        double edge = holdEdge(edge0, launchEdge(static_cast<int>(di), pred_min));
+                        double capture = arr_max[ci] - edge0 + edge;
                         double credit = crpr(launchClockPin(static_cast<int>(di), pred_min), static_cast<int>(ci));
                         double required = capture + margin + clock->uncertainty_hold - credit;
                         cands.push_back({static_cast<int>(n), e, false, kind, arr_min[di], required, arr_min[di] - required,
-                                         edge, arr_max[ci] - edgeTime(ce) - credit, margin, clock->uncertainty_hold});
+                                         edge, arr_max[ci] - edge0 - credit, margin, clock->uncertainty_hold});
                     }
                 }
             }
@@ -512,13 +556,13 @@ class Timer {
             for (Edge e : kEdges) {
                 size_t i = p * 2 + e;
                 if (has_max && arr_max[i] > -kInf) {
-                    double edge = period + edgeTime(RISE);
+                    double edge = setupEdge(edgeTime(RISE), launchEdge(static_cast<int>(i), pred_max));
                     double required = edge + latency - d_max - clock->uncertainty_setup;
                     cands.push_back({static_cast<int>(p), e, true, "setup", arr_max[i], required, required - arr_max[i],
                                      edge, latency, d_max, clock->uncertainty_setup});
                 }
                 if (has_min && arr_min[i] < kInf) {
-                    double edge = edgeTime(RISE);
+                    double edge = holdEdge(edgeTime(RISE), launchEdge(static_cast<int>(i), pred_min));
                     double required = edge + latency - d_min + clock->uncertainty_hold;
                     cands.push_back({static_cast<int>(p), e, false, "hold", arr_min[i], required, arr_min[i] - required,
                                      edge, latency, d_min, clock->uncertainty_hold});
@@ -558,7 +602,7 @@ class Timer {
             pt.cell = node.inst >= 0 ? nl.instances[node.inst].cell->name : "";
             pt.edge = static_cast<Edge>(i % 2);
             pt.arrival = arr[i];
-            pt.slew = slew[i];
+            pt.slew = slew[i];   // in the pin's own library terms, as OpenSTA reports it
             pt.is_driver = node.kind == NodeKind::PORT_IN || node.kind == NodeKind::PIN_OUT;
             pt.cap = pt.is_driver && node.net > CellNetlist::kConst1 ? net_cap[node.net][pt.edge * 2 + (c.max ? 0 : 1)] : 0;
             pt.delay = k == 0 ? arr[i] : arr[i] - previous;

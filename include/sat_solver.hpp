@@ -42,6 +42,10 @@ public:
     virtual bool failed(int lit) const = 0;
 
     virtual Stats stats() const = 0;
+
+    // Not part of IPASIR: give up (UNKNOWN) after this many conflicts in the next solve() call;
+    // 0 means no limit. Solvers without it just ignore the limit.
+    virtual void setConflictLimit(uint64_t /*conflicts*/) {}
 };
 
 // The built-in CDCL solver ("cdcl")

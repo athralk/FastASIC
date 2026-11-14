@@ -93,6 +93,19 @@ class Parser {
         return text.substr(start, pos - start);
     }
 
+    // A group or complex-attribute argument: a quoted string, or raw text up to ',' / ')'
+    // (so pin(A_ADDR[9:0]) keeps its range)
+    std::string_view argument() {
+        skipSpace();
+        if (pos < text.size() && text[pos] == '"') return token();
+        size_t start = pos;
+        while (pos < text.size() && text[pos] != ',' && text[pos] != ')' && text[pos] != '\n') pos++;
+        size_t end = pos;
+        while (end > start && (text[end - 1] == ' ' || text[end - 1] == '\t' || text[end - 1] == '\r')) end--;
+        if (start == end) error("empty argument");
+        return text.substr(start, end - start);
+    }
+
     char peek() {
         skipSpace();
         return pos < text.size() ? text[pos] : '\0';
@@ -110,9 +123,13 @@ class Parser {
             char next = peek();
             if (next == ':') {
                 pos++;
+                skipSpace();
+                bool quoted = pos < text.size() && text[pos] == '"';
+                int value_line = line;
                 std::string_view value = token();
-                // Rare unquoted multi-token values (e.g. expressions) run to the ';'
-                while (peek() != ';' && peek() != '}' && peek() != '\0') {
+                // Rare unquoted multi-token values (e.g. expressions) run to the ';' on the same
+                // line; some libraries omit the ';' after a value, so a new line ends it too
+                while (!quoted && peek() != ';' && peek() != '}' && peek() != '\0' && line == value_line) {
                     std::string_view more = token();
                     value = std::string_view(value.data(), more.data() + more.size() - value.data());
                 }
@@ -122,7 +139,7 @@ class Parser {
                 pos++;
                 std::vector<std::string_view> args;
                 while (peek() != ')') {
-                    args.push_back(token());
+                    args.push_back(argument());
                     if (peek() == ',') pos++;
                 }
                 pos++;
@@ -238,6 +255,8 @@ class Converter {
     double time_scale = 1000;   // ps per library time unit
     double cap_scale = 1000;    // fF per library capacitance unit
     std::unordered_map<std::string, Template> templates;
+    std::unordered_map<std::string, std::pair<int, int>> types;   // bus types: bit_from, bit_to
+    double slew_fraction = 0.6;
 
     double scaleFor(TableVar v) const {
         return v == TableVar::OUTPUT_CAP ? cap_scale : (v == TableVar::NONE ? 1 : time_scale);
@@ -270,19 +289,24 @@ class Converter {
         return t;
     }
 
-    void readPin(const Group& g, std::string_view name, LibCell& cell, std::vector<std::pair<const Group*, int>>& timing) {
-        LibPin pin;
-        pin.name = std::string(name);
+    // Applies the pin attributes present in g (bus groups provide defaults for their bits)
+    void applyPin(const Group& g, LibPin& pin) const {
         std::string_view dir = g.attr("direction");
         if (dir == "output") pin.dir = PinDir::OUTPUT;
+        else if (dir == "input") pin.dir = PinDir::INPUT;
         else if (dir == "inout") pin.dir = PinDir::INOUT;
         else if (dir == "internal") pin.dir = PinDir::INTERNAL;
-        pin.cap = number(g.attr("capacitance")) * cap_scale;
-        std::string_view rc = g.attr("rise_capacitance"), fc = g.attr("fall_capacitance");
-        pin.rise_cap = rc.empty() ? pin.cap : number(rc) * cap_scale;
-        pin.fall_cap = fc.empty() ? pin.cap : number(fc) * cap_scale;
-        pin.rise_cap_min = pin.rise_cap_max = pin.rise_cap;
-        pin.fall_cap_min = pin.fall_cap_max = pin.fall_cap;
+        if (std::string_view c = g.attr("capacitance"); !c.empty()) {
+            pin.cap = number(c) * cap_scale;
+            pin.rise_cap = pin.fall_cap = pin.cap;
+            pin.rise_cap_min = pin.rise_cap_max = pin.fall_cap_min = pin.fall_cap_max = pin.cap;
+        }
+        if (std::string_view rc = g.attr("rise_capacitance"); !rc.empty()) {
+            pin.rise_cap = pin.rise_cap_min = pin.rise_cap_max = number(rc) * cap_scale;
+        }
+        if (std::string_view fc = g.attr("fall_capacitance"); !fc.empty()) {
+            pin.fall_cap = pin.fall_cap_min = pin.fall_cap_max = number(fc) * cap_scale;
+        }
         if (const auto* r = g.complexAttr("rise_capacitance_range"); r && r->size() == 2) {
             pin.rise_cap_min = number((*r)[0]) * cap_scale;
             pin.rise_cap_max = number((*r)[1]) * cap_scale;
@@ -291,10 +315,17 @@ class Converter {
             pin.fall_cap_min = number((*f)[0]) * cap_scale;
             pin.fall_cap_max = number((*f)[1]) * cap_scale;
         }
-        pin.max_cap = number(g.attr("max_capacitance")) * cap_scale;
-        pin.max_transition = number(g.attr("max_transition")) * time_scale;
-        pin.is_clock = g.attr("clock") == "true";
-        pin.function = std::string(g.attr("function"));
+        if (std::string_view v = g.attr("max_capacitance"); !v.empty()) pin.max_cap = number(v) * cap_scale;
+        if (std::string_view v = g.attr("max_transition"); !v.empty()) pin.max_transition = number(v) * time_scale;
+        if (std::string_view v = g.attr("clock"); !v.empty()) pin.is_clock = v == "true";
+        if (std::string_view v = g.attr("function"); !v.empty()) pin.function = std::string(v);
+        if (std::string_view v = g.attr("three_state"); !v.empty()) pin.three_state = std::string(v);
+    }
+
+    void readPin(const Group& g, std::string_view name, LibCell& cell, std::vector<std::pair<const Group*, int>>& timing) {
+        LibPin pin;
+        pin.name = std::string(name);
+        applyPin(g, pin);
         int index = static_cast<int>(cell.pins.size());
         cell.pins.push_back(pin);
         for (const Group& sub : g.groups) {
@@ -302,15 +333,78 @@ class Converter {
         }
     }
 
+    // bus(NAME): one pin per bit, then per-bit pin(NAME[i]) and range pin(NAME[a:b]) groups
+    void readBus(const Group& g, LibCell& cell, std::vector<std::pair<const Group*, int>>& timing) {
+        if (g.args.empty()) return;
+        LibBus bus;
+        bus.name = std::string(g.args[0]);
+        auto type = types.find(std::string(g.attr("bus_type")));
+        if (type == types.end()) throw std::runtime_error("bus " + bus.name + " in " + cell.name + ": unknown bus_type");
+        bus.from = type->second.first;
+        bus.to = type->second.second;
+        LibPin defaults;
+        applyPin(g, defaults);
+        int step = bus.from >= bus.to ? -1 : 1;
+        for (int b = bus.from;; b += step) {
+            LibPin pin = defaults;
+            pin.name = bus.name + "[" + std::to_string(b) + "]";
+            bus.pins.push_back(static_cast<int>(cell.pins.size()));
+            cell.pins.push_back(pin);
+            if (b == bus.to) break;
+        }
+        auto bitIndex = [&](int b) {
+            int k = (b - bus.from) * step;
+            if (k < 0 || k >= static_cast<int>(bus.pins.size())) throw std::runtime_error("bit " + std::to_string(b) + " is outside bus " + bus.name);
+            return bus.pins[k];
+        };
+        for (const Group& sub : g.groups) {
+            if (sub.type == "timing") {
+                for (int idx : bus.pins) timing.emplace_back(&sub, idx);
+            } else if (sub.type == "pin") {
+                for (std::string_view arg : sub.args) {
+                    // NAME[i] or NAME[a:b]
+                    std::string a(arg);
+                    size_t open = a.find('['), colon = a.find(':'), close = a.find(']');
+                    std::vector<int> bits;
+                    if (open == std::string::npos) {
+                        bits = bus.pins;
+                    } else if (colon == std::string::npos) {
+                        bits.push_back(bitIndex(std::stoi(a.substr(open + 1, close - open - 1))));
+                    } else {
+                        int hi = std::stoi(a.substr(open + 1, colon - open - 1)), lo = std::stoi(a.substr(colon + 1, close - colon - 1));
+                        for (int b = std::min(hi, lo); b <= std::max(hi, lo); ++b) bits.push_back(bitIndex(b));
+                    }
+                    for (int idx : bits) {
+                        applyPin(sub, cell.pins[idx]);
+                        for (const Group& t : sub.groups) {
+                            if (t.type == "timing") timing.emplace_back(&t, idx);
+                        }
+                    }
+                }
+            }
+        }
+        cell.buses.push_back(std::move(bus));
+    }
+
     void readArc(const Group& g, int to_pin, LibCell& cell) {
         std::string related(g.attr("related_pin"));
         std::istringstream names(related);
         std::string from;
+        std::vector<int> froms;
         while (names >> from) {   // "A B" means one arc from each
+            int p = cell.pinIndex(from);
+            if (p >= 0) froms.push_back(p);
+            else if (const LibBus* bus = cell.findBus(from)) froms.insert(froms.end(), bus->pins.begin(), bus->pins.end());
+        }
+        names.clear();
+        names.str(std::string(g.attr("related_bus_pins")));
+        while (names >> from) {
+            if (const LibBus* bus = cell.findBus(from)) froms.insert(froms.end(), bus->pins.begin(), bus->pins.end());
+        }
+        for (int from_pin : froms) {
             LibArc arc;
             arc.to_pin = to_pin;
-            arc.from_pin = cell.pinIndex(from);
-            if (arc.from_pin < 0) continue;
+            arc.from_pin = from_pin;
             std::string_view sense = g.attr("timing_sense");
             arc.sense = sense == "positive_unate" ? TimingSense::POSITIVE
                       : sense == "negative_unate" ? TimingSense::NEGATIVE : TimingSense::NON;
@@ -331,12 +425,19 @@ class Converter {
     LibCell readCell(const Group& g) {
         LibCell cell;
         cell.name = g.args.empty() ? "" : std::string(g.args[0]);
+        cell.slew_fraction = slew_fraction;
         cell.area = number(g.attr("area"));
         cell.leakage = number(g.attr("cell_leakage_power"));
         std::vector<std::pair<const Group*, int>> timing;
         for (const Group& sub : g.groups) {
             if (sub.type == "pin") {
                 for (std::string_view name : sub.args) readPin(sub, name, cell, timing);
+            } else if (sub.type == "bus") {
+                readBus(sub, cell, timing);
+            } else if (sub.type == "memory") {
+                cell.is_macro = true;
+                cell.address_width = static_cast<int>(number(sub.attr("address_width")));
+                cell.word_width = static_cast<int>(number(sub.attr("word_width")));
             } else if (sub.type == "ff") {
                 cell.is_sequential = true;
                 cell.ff_clocked_on = std::string(sub.attr("clocked_on"));
@@ -363,12 +464,24 @@ public:
             std::transform(unit.begin(), unit.end(), unit.begin(), ::tolower);
             cap_scale = mult * (unit == "pf" ? 1000 : unit == "ff" ? 1 : unit == "nf" ? 1e6 : 1000);
         }
+        auto pct = [&](const char* name, double fallback) {
+            std::string_view v = root.attr(name);
+            return v.empty() ? fallback : number(v);
+        };
+        double derate = pct("slew_derate_from_library", 1.0);
+        slew_fraction = (pct("slew_upper_threshold_pct_rise", 80) - pct("slew_lower_threshold_pct_rise", 20)) / 100.0 / derate;
+        lib.slew_fraction = slew_fraction;
         lib.time_unit_ps = time_scale;
         lib.cap_unit_ff = cap_scale;
         lib.nom_voltage = number(root.attr("nom_voltage"));
         lib.nom_temperature = number(root.attr("nom_temperature"));
         lib.leakage_unit = std::string(root.attr("leakage_power_unit"));
 
+        for (const Group& g : root.groups) {
+            if (g.type == "type" && !g.args.empty()) {
+                types[std::string(g.args[0])] = {static_cast<int>(number(g.attr("bit_from"))), static_cast<int>(number(g.attr("bit_to")))};
+            }
+        }
         for (const Group& g : root.groups) {
             if (g.type != "lu_table_template" || g.args.empty()) continue;
             Template t;
@@ -452,6 +565,13 @@ int LibCell::outputPin() const {
         if (pins[i].dir == PinDir::OUTPUT) return static_cast<int>(i);
     }
     return -1;
+}
+
+const LibBus* LibCell::findBus(const std::string& bus_name) const {
+    for (const auto& b : buses) {
+        if (b.name == bus_name) return &b;
+    }
+    return nullptr;
 }
 
 const LibCell* Library::find(const std::string& cell_name) const {

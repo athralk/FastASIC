@@ -11,6 +11,7 @@ struct CecResult {
     size_t outputs = 0;
     size_t structural = 0;      // proved with no SAT call: both sides hashed to the same AIG node
     size_t by_sat = 0;          // proved by an UNSAT miter
+    size_t swept = 0;           // internal node pairs proven equal by SAT sweeping
     size_t aig_ands = 0;        // AND nodes in the shared AIG of both designs
     SatSolver::Stats sat;
     double milliseconds = 0;

@@ -281,12 +281,20 @@ class NetlistParser {
             expect(".");
             std::string pin = ident();
             int index = cell->pinIndex(pin);
-            if (index < 0) error("cell " + cell_name + " has no pin '" + pin + "'");
+            const LibBus* bus = index < 0 ? cell->findBus(pin) : nullptr;
+            if (index < 0 && !bus) error("cell " + cell_name + " has no pin '" + pin + "'");
             expect("(");
             if (!is(")")) {
-                std::vector<int> bits = expr();
-                if (bits.size() != 1) error("pin " + inst.name + "/" + pin + " is connected to " + std::to_string(bits.size()) + " bits");
-                inst.pin_net[index] = bits[0];
+                std::vector<int> bits = expr();   // most significant first
+                if (bus) {
+                    // LSB-aligned onto the bus pins (also listed most significant first)
+                    if (bits.size() > bus->pins.size()) error("bus " + inst.name + "/" + pin + " is connected to " + std::to_string(bits.size()) + " bits");
+                    size_t offset = bus->pins.size() - bits.size();
+                    for (size_t k = 0; k < bits.size(); ++k) inst.pin_net[bus->pins[offset + k]] = bits[k];
+                } else {
+                    if (bits.size() != 1) error("pin " + inst.name + "/" + pin + " is connected to " + std::to_string(bits.size()) + " bits");
+                    inst.pin_net[index] = bits[0];
+                }
             }
             expect(")");
             if (is(",")) pos++;
@@ -529,11 +537,33 @@ void writeCellNetlist(std::ostream& out, const CellNetlist& nl) {
         if (is_port_name[net] && b != std::string::npos) return name;   // "a[3]" of a declared port vector
         return verilogName(name);
     };
+    int dangling = 0;
     for (const auto& inst : nl.instances) {
         out << "  " << inst.cell->name << " " << verilogName(inst.name) << " (";
         bool first = true;
+        std::vector<bool> in_bus(inst.pin_net.size(), false);
+        for (const LibBus& bus : inst.cell->buses) {
+            bool any = false;
+            for (int k : bus.pins) {
+                in_bus[k] = true;
+                any |= inst.pin_net[k] >= 0;
+            }
+            if (!any) continue;
+            out << (first ? "" : ",") << "\n    ." << bus.name << "({";
+            for (size_t i = 0; i < bus.pins.size(); ++i) {
+                int net = inst.pin_net[bus.pins[i]];
+                std::string text = net >= 0 ? ref(net)
+                                 : inst.cell->pins[bus.pins[i]].dir == PinDir::OUTPUT ? "" : "1'b0";
+                if (text.empty()) {   // an unconnected output bit still needs a net in a concatenation
+                    text = "\\_dangling" + std::to_string(dangling++) + "_ ";
+                }
+                out << (i ? ", " : "") << text;
+            }
+            out << "})";
+            first = false;
+        }
         for (size_t k = 0; k < inst.pin_net.size(); ++k) {
-            if (inst.pin_net[k] < 0) continue;
+            if (inst.pin_net[k] < 0 || in_bus[k]) continue;
             out << (first ? "" : ",") << "\n    ." << inst.cell->pins[k].name << "(" << ref(inst.pin_net[k]) << ")";
             first = false;
         }
@@ -604,6 +634,42 @@ GateForest cellNetlistToForest(const CellNetlist& nl) {
         auto root = make(GateType::OUTPUT, pb.name);
         root->addFanin(build(pb.net));
         forest.push_back(root);
+    }
+    // Flip-flops: the register output is a free input named after its net (above); its next
+    // state, from the Liberty ff group's next_state, becomes a root named nextStateName(net)
+    // Hard macros: their input pins are cut points named like the elaborator names them
+    for (const auto& inst : nl.instances) {
+        if (!inst.cell->is_macro) continue;
+        for (size_t k = 0; k < inst.pin_net.size(); ++k) {
+            if (inst.pin_net[k] < 0 || inst.cell->pins[k].dir == PinDir::OUTPUT) continue;
+            auto root = make(GateType::OUTPUT, macroInputName(inst.name, inst.cell->pins[k].name));
+            root->addFanin(build(inst.pin_net[k]));
+            forest.push_back(root);
+        }
+    }
+    for (const auto& inst : nl.instances) {
+        if (!inst.cell->is_sequential || inst.cell->is_latch || inst.cell->ff_next_state.empty()) continue;
+        for (size_t k = 0; k < inst.pin_net.size(); ++k) {
+            const LibPin& pin = inst.cell->pins[k];
+            if (pin.dir != PinDir::OUTPUT || inst.pin_net[k] < 0) continue;
+            if (pin.function != "IQ" && pin.function != "IQN") continue;
+            std::function<std::shared_ptr<GateNode>(const std::string&)> pinNode = [&](const std::string& p) {
+                int j = inst.cell->pinIndex(p);
+                if (j < 0) throw std::runtime_error(inst.cell->name + ": next_state uses unknown pin '" + p + "'");
+                if (inst.pin_net[j] < 0) throw std::runtime_error(inst.name + "/" + p + " is unconnected");
+                return build(inst.pin_net[j]);
+            };
+            std::function<std::shared_ptr<GateNode>(GateType)> maker = [&](GateType t) { return make(t); };
+            auto next = FunctionBuilder(inst.cell->ff_next_state, pinNode, maker).build();
+            if (pin.function == "IQN") {
+                auto inv = make(GateType::NOT);
+                inv->addFanin(next);
+                next = inv;
+            }
+            auto root = make(GateType::OUTPUT, nextStateName(nl.net_names[inst.pin_net[k]]));
+            root->addFanin(next);
+            forest.push_back(root);
+        }
     }
     return forest;
 }

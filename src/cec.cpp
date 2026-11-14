@@ -169,38 +169,120 @@ CecResult proveEquivalence(const GateForest& fa, const GateForest& fb, const std
 
     std::unique_ptr<SatSolver> solver = makeSatSolver(solver_name);
     CnfEncoder cnf(aig, *solver);
-    for (const OutputPair& pair : pairs) {
-        if (pair.a == pair.b) {
-            result.structural++;
-            continue;
-        }
-
-        // Miter: m <-> (x XOR y); ask whether m can be true
-        int x = cnf.literal(pair.a), y = cnf.literal(pair.b);
+    auto miter = [&](int x, int y) {   // m <-> (x XOR y)
         int m = cnf.newVar();
         for (auto clause : {std::vector<int>{-m, x, y}, {-m, -x, -y}, {m, -x, y}, {m, x, -y}}) {
             for (int lit : clause) solver->add(lit);
             solver->add(0);
         }
+        return m;
+    };
+    auto assertEqual = [&](int m, int x, int y) {
+        for (auto clause : {std::vector<int>{-m}, {-x, y}, {x, -y}}) {
+            for (int lit : clause) solver->add(lit);
+            solver->add(0);
+        }
+    };
+
+    // SAT sweeping, over the cones of the outputs given: internal nodes whose simulation
+    // signatures agree (up to inversion) are proven equal bottom-up, each with a small conflict
+    // budget, and every proven pair is added as clauses. The remaining output proofs then only
+    // have to cross small gaps (two differently built multipliers are hopeless for plain SAT).
+    auto sweep = [&](const std::vector<const OutputPair*>& hard) {
+        std::vector<bool> in_cone(aig.nodeCount(), false);
+        std::vector<uint32_t> work;
+        for (const OutputPair* p : hard) {
+            work.push_back(aigNode(p->a));
+            work.push_back(aigNode(p->b));
+        }
+        while (!work.empty()) {
+            uint32_t n = work.back();
+            work.pop_back();
+            if (in_cone[n]) continue;
+            in_cone[n] = true;
+            if (aig.isAnd(n)) {
+                work.push_back(aigNode(aig.fanin0(n)));
+                work.push_back(aigNode(aig.fanin1(n)));
+            }
+        }
+        constexpr int kWords = 8;   // 512 random patterns
+        std::vector<std::vector<uint64_t>> sig(aig.nodeCount(), std::vector<uint64_t>(kWords));
+        for (int w = 0; w < kWords; ++w) {
+            std::vector<uint64_t> inputs(n_inputs);
+            for (auto& word : inputs) word = rng();
+            std::vector<uint64_t> values = simulateAig(aig, inputs);
+            for (size_t n = 0; n < aig.nodeCount(); ++n) sig[n][w] = values[n];
+        }
+        std::map<std::vector<uint64_t>, AigLit> representative;   // canonical signature -> literal
+        solver->setConflictLimit(200);
+        for (uint32_t node = 0; node < aig.nodeCount(); ++node) {
+            if (!in_cone[node] && node != 0) continue;
+            bool flip = sig[node][0] & 1;   // canonical form: pattern 0 gives 0
+            std::vector<uint64_t> key = sig[node];
+            if (flip) {
+                for (auto& w : key) w = ~w;
+            }
+            AigLit lit = aigLiteral(node, flip);   // the literal whose signature is `key`
+            auto it = representative.find(key);
+            if (it == representative.end()) {
+                representative.emplace(key, lit);
+                continue;
+            }
+            if (!aig.isAnd(node)) continue;
+            int x = cnf.literal(lit), y = cnf.literal(it->second);
+            int m = miter(x, y);
+            solver->assume(m);
+            if (solver->solve() == SatSolver::UNSATISFIABLE) {
+                assertEqual(m, x, y);
+                result.swept++;
+            }
+        }
+        solver->setConflictLimit(0);
+    };
+
+    // Output pairs: first with a small conflict budget each (enough for nearly every design);
+    // the ones that resist get their cones swept, then are proven without a budget
+    auto prove = [&](const OutputPair& pair, uint64_t budget) -> int {
+        int x = cnf.literal(pair.a), y = cnf.literal(pair.b);
+        int m = miter(x, y);   // m <-> (x XOR y): can it be true?
+        solver->setConflictLimit(budget);
         solver->assume(m);
         int status = solver->solve();
-
+        solver->setConflictLimit(0);
         if (status == SatSolver::SATISFIABLE) {
             std::vector<bool> pattern(n_inputs);
             for (size_t i = 0; i < n_inputs; ++i) pattern[i] = cnf.inputValue(aig.inputNodes()[i]);
             confirmCounterexample(fa, fb, aig, pair.name, pattern);
             result.message = describeCounterexample(aig, pair.name, pattern, pair.a, pair.b);
+        } else if (status == SatSolver::UNSATISFIABLE) {
+            assertEqual(m, x, y);   // keep the fact: x <-> y helps the cones built on top of it
+            result.by_sat++;
+        }
+        return status;
+    };
+    std::vector<const OutputPair*> hard;
+    for (const OutputPair& pair : pairs) {
+        if (pair.a == pair.b) {
+            result.structural++;
+            continue;
+        }
+        int status = prove(pair, 100);
+        if (status == SatSolver::SATISFIABLE) {
             result.sat = solver->stats();
             return finish();
         }
-        if (status != SatSolver::UNSATISFIABLE) throw std::runtime_error("SAT solver gave up on output '" + pair.name + "'");
-
-        // Proven: keep the fact. The miter can never fire, and x <-> y helps later cones.
-        for (auto clause : {std::vector<int>{-m}, {-x, y}, {x, -y}}) {
-            for (int lit : clause) solver->add(lit);
-            solver->add(0);
+        if (status != SatSolver::UNSATISFIABLE) hard.push_back(&pair);
+    }
+    if (!hard.empty()) {
+        sweep(hard);
+        for (const OutputPair* pair : hard) {
+            int status = prove(*pair, 0);
+            if (status == SatSolver::SATISFIABLE) {
+                result.sat = solver->stats();
+                return finish();
+            }
+            if (status != SatSolver::UNSATISFIABLE) throw std::runtime_error("SAT solver gave up on output '" + pair->name + "'");
         }
-        result.by_sat++;
     }
 
     result.equivalent = true;

@@ -9,7 +9,11 @@ while IFS= read -r line; do
     [[ "$line" =~ ^# || -z "$line" ]] && continue
     read -r netlist sdc corner extra _ ws wh ts <<< "$line"
     args=(-q -corner "$corner" -sdc "$ROOT/bench/sta/$sdc")
-    if [ "$extra" != "-" ]; then IFS=: read -r _ buf fan <<< "$extra"; args+=(-cts "$buf" -cts_fanout "$fan"); fi
+    REF=${PDK_ROOT:-$HOME/ttsetup/pdk}/ihp-sg13cmos5l/libs.ref
+    case $extra in
+        -cts:*) IFS=: read -r _ buf fan <<< "$extra"; args+=(-cts "$buf" -cts_fanout "$fan") ;;
+        -lib:*) args+=(-lib "$REF/sg13cmos5l_stdcell/lib/sg13cmos5l_stdcell_${corner}_1p20V_25C.lib" -lib "$REF/${extra#-lib:}") ;;
+    esac
     out=$("$LSTA" "${args[@]}" "$ROOT/$netlist" 2>&1)
     read -r gs gt <<< "$(awk '/^  setup/ {print $2, $3}' <<< "$out")"
     gh=$(awk '/^  hold/ {print $2}' <<< "$out")
