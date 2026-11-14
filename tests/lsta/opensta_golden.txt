@@ -1,0 +1,19 @@
+# Golden values from OpenSTA 2.6.0 (OpenLane 2 image ghcr.io/efabless/openlane2:2.3.10) on the
+# same netlists and constraints; produced with tools/compare_opensta.sh. lsta must agree within
+# 0.02 ps on WNS (both tools print rounded values) and 1 ppm on TNS (a sum over all endpoints;
+# OpenSTA computes in 32-bit floats).
+# netlist                     sdc            corner  extra lsta args              | WNS setup   WNS hold   TNS setup
+bench/sta/netlists/acc16.v    acc16.sdc      typ     -                            | -488.67     230.69     -1237.50
+bench/sta/netlists/acc16.v    default.sdc    typ     -                            | 1464.10     199.85     0.00
+bench/sta/netlists/acc16.v    default.sdc    slow    -                            | 275.85      362.09     0.00
+bench/sta/netlists/mul16.v    default.sdc    typ     -                            | -569.49     348.56     -2082.41
+bench/sta/netlists/mul16.v    default.sdc    slow    -                            | -3575.50    594.82     -37760.18
+bench/sta/netlists/mac32.v    default.sdc    typ     -                            | -5454.65    213.25     -121089.09
+bench/sta/netlists/mac32.v    default.sdc    slow    -                            | -10510.42   381.98     -288471.65
+bench/sta/netlists/add64.v    virtual.sdc    fast    -                            | -1767.55    1052.33    -23912.81
+bench/sta/netlists/mul16.v    propagated.sdc typ     -cts:sg13cmos5l_buf_8:6      | -547.25     318.98     -1961.92
+# with IHP SRAM macros (netlists from our own --map): WNS / TNS agree exactly; single endpoints at
+# macro pins can differ by tens of ps because OpenSTA 2.6.0 compounds the slew conversion between
+# libraries over the loads of a net (see README), which lsta does not
+bench/sta/netlists/sram_buffer.v default.sdc typ   -lib:sg13cmos5l_sram/lib/RM_IHPSG13_1P_1024x8_c2_bm_bist_typ_1p20V_25C.lib | -624.98 259.44 -4999.87
+bench/sta/netlists/fifo_2p.v     default.sdc typ   -lib:sg13cmos5l_sram/lib/RM_IHPSG13_2P_256x8_c2_bm_bist_typ_1p20V_25C.lib  | 653.73  -403.21 0.00

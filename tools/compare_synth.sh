@@ -22,7 +22,7 @@ for f in "${designs[@]}"; do
     row=$(printf "%-18s" "$(basename "$f" .v)")
     for goal in area delay; do
         s=$(date +%s%N)
-        "$ROOT/output_test" -q --map $goal -o "$TMP/$goal.v" "$f" > "$TMP/$goal.log" 2>&1 || { row+=" | failed"; continue; }
+        "$ROOT/FastASIC" -q --map $goal -o "$TMP/$goal.v" "$f" > "$TMP/$goal.log" 2>&1 || { row+=" | failed"; continue; }
         ms=$((($(date +%s%N) - s) / 1000000))
         grep -q "original vs cells: PASS" "$TMP/$goal.log" || row+=" (NOT VERIFIED)"
         read -r c a p <<< "$(stats "$TMP/$goal.v")"

@@ -12,7 +12,7 @@ printf "%-14s %12s %14s %9s\n" design "mycompiler (ms)" "yosys+abc (ms)" speed-u
 tot_o=0; tot_y=0
 for f in "${designs[@]}"; do
     top=$(grep -m1 -oE '^\s*module\s+[A-Za-z_][A-Za-z0-9_]*' "$f" | awk '{print $2}')
-    o=$(best "$ROOT/output_test" -q --map area -o "$TMP/o.v" "$f")
+    o=$(best "$ROOT/FastASIC" -q --map area -o "$TMP/o.v" "$f")
     y=$(best "$ROOT/tools/synth_yosys.sh" "$f" "$top" "$TMP/y.v")
     tot_o=$((tot_o+o)); tot_y=$((tot_y+y))
     printf "%-14s %12s %14s %8sx\n" "$(basename "$f" .v)" "$o" "$y" "$(awk "BEGIN{printf \"%.1f\", $y/($o>0?$o:1)}")"

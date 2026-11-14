@@ -7,7 +7,7 @@
 #     address-like inputs are kept small so memory reads hit written words
 # IHP SRAM macros in the netlist are simulated with the PDK's own functional model.
 #
-# usage: tests/cosim.sh <output_test> <design.v> [vectors] [extra output_test options]
+# usage: tests/cosim.sh <FastASIC> <design.v> [vectors] [extra FastASIC options]
 #        COSIM_MUTATE='sed expression' edits the netlist first (to check that the check can fail)
 set -euo pipefail
 BIN=$1

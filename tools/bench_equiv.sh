@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Benchmarks our SAT equivalence checker against Yosys and ABC on the same design pairs:
-#   ours   output_test --equiv a.v b.v         (our frontend + AIG + incremental CDCL)
+#   ours   FastASIC --equiv a.v b.v         (our frontend + AIG + incremental CDCL)
 #   yosys  miter -equiv + sat -prove-asserts    (Yosys frontend, word-level cells bit-blasted
 #                                                into MiniSat by ezSAT)
 #   abc    ABC's &cec (simulation + SAT sweeping), on files written by Yosys, in two modes:
@@ -25,7 +25,7 @@
 set -u
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
-BIN=$ROOT/output_test
+BIN=$ROOT/FastASIC
 LIMIT=${1:-60}
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT

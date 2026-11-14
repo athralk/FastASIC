@@ -1,6 +1,6 @@
 # Build output
-output_test
+/FastASIC
 tests/sta_bruteforce
 *.o
 tests/sat_fuzz
-lsta
+/lsta

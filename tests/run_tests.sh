@@ -21,7 +21,7 @@
 #     tree-covering onto real cells (SAT-checked against the RTL), netlist write/read round trip
 set -u
 
-BIN=${1:-./output_test}
+BIN=${1:-./FastASIC}
 DIR=$(cd "$(dirname "$0")" && pwd)
 passed=0
 failed=0

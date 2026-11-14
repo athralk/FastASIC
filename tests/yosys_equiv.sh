@@ -6,7 +6,7 @@
 # Unlike our own random simulation this is a proof, and it uses an independent Verilog frontend,
 # so it also catches mistakes in how we interpret the language (widths, precedence, ...).
 #
-# usage: yosys_equiv.sh <output_test binary> <design.v>
+# usage: yosys_equiv.sh <FastASIC binary> <design.v>
 set -euo pipefail
 
 BIN=$1
