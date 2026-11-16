@@ -18,7 +18,9 @@
 #   + if the IHP sg13cmos5l PDK is installed: hard-macro (SRAM) designs in macro/, SRAM inference
 #     in infer/ (co-simulated against the RTL with the PDK's SRAM model, cosim_sram.sh), lsta against
 #     OpenSTA golden values (lsta_golden.sh),
-#     tree-covering onto real cells (SAT-checked against the RTL), netlist write/read round trip
+#     tree-covering onto real cells (SAT-checked against the RTL), netlist write/read round trip,
+#     physical design (fastpnr floorplan, placement and global routing, self-checked;
+#     FASTASIC_OPENROAD=1 also hands the floorplans to OpenROAD in docker)
 set -u
 
 BIN=${1:-./FastASIC}
@@ -185,6 +187,39 @@ if [ -f "$PDK_LIB" ]; then
     done
     check "adder8.v --sta --delay-model nldm" 0 "Summary (ps)" "$BIN" -q --sta --delay-model nldm "$DIR/cases/adder8.v"
     check "counter.v --sta --delay-model nldm (register paths)" 0 "rising edge-triggered flip-flop" "$BIN" -q --sta --delay-model nldm "$DIR/seq/counter.v"
+else
+    echo "  skipped (IHP sg13cmos5l PDK not found)"
+fi
+
+PNR=$(dirname "$BIN")/fastpnr
+echo "Physical design (fastpnr: floorplan, placement, global routing; every result self-checked;"
+echo "OpenROAD also checks the floorplans with FASTASIC_OPENROAD=1):"
+if [ -f "$PDK_LIB" ] && [ -x "$PNR" ]; then
+    FP_TMP=$(mktemp -d)
+    # a 52k-cell design: 8 copies of mac32 (generated, too large to keep in the repo)
+    python3 "$DIR/../tools/replicate_netlist.py" "$DIR/../bench/sta/netlists/mac32.v" 8 > "$FP_TMP/mac32_x8.v"
+    for f in "$DIR"/../bench/sta/netlists/*.v "$FP_TMP/mac32_x8.v"; do
+        check "$(basename "$f"): placed legally, routed without overflow" 0 "2D overflow 0" "$PNR" -o "$FP_TMP/$(basename "$f" .v).def" "$f"
+    done
+    for f in "$DIR"/../bench/sta/netlists/mul16.v "$DIR"/../bench/sta/netlists/sram_buffer.v "$DIR"/../bench/sta/netlists/fifo_2p.v; do
+        check "$(basename "$f"): floorplan only" 0 "Power grid" "$PNR" -no-place -o "$FP_TMP/$(basename "$f" .v).fp.def" "$f"
+    done
+    for f in "$DIR"/cases/alu4.v "$DIR"/seq/counter.v "$DIR"/lang/multipliers.v; do
+        "$BIN" -q --map area -o "$FP_TMP/$(basename "$f" .v).cells.v" "$f" > /dev/null 2>&1
+        check "$(basename "$f"): synthesized, then placed and routed" 0 "2D overflow 0" "$PNR" -o "$FP_TMP/$(basename "$f" .v).def" "$FP_TMP/$(basename "$f" .v).cells.v"
+    done
+    check "route guides written for every routed net" 0 "Metal3" bash -c "'$PNR' -q -guide '$FP_TMP/mul16.guide' '$DIR/../bench/sta/netlists/mul16.v' && grep -c '^(' '$FP_TMP/mul16.guide' > /dev/null && head -5 '$FP_TMP/mul16.guide'"
+    check "tie cells replace constant inputs (fifo_2p)" 0 "86 tie cells added" "$PNR" "$DIR/../bench/sta/netlists/fifo_2p.v"
+    check "fixed die too small for the cells" 1 "do not fit in the rows" "$PNR" -die 60 60 "$DIR/../bench/sta/netlists/mul16.v"
+    check "fixed die too small for the pins" 1 "not enough room" "$PNR" -die 24 24 "$DIR/../bench/sta/netlists/mul16.v"
+    check "fixed die, utilization reported" 0 "Die         250.00 x 250.00 um" "$PNR" -die 250 250 "$DIR/../bench/sta/netlists/mul16.v"
+    check "cell without a LEF macro" 1 "unknown cell" "$PNR" "$DIR/pnr/unknown_cell.v"
+    if [ "${FASTASIC_OPENROAD:-0}" = 1 ]; then
+        for d in mul16 sram_buffer fifo_2p; do
+            check "OpenROAD accepts $d.fp.def (placement, power grid, global route)" 0 "global_route ok" bash "$DIR/../tools/check_def_openroad.sh" "$FP_TMP/$d.fp.def"
+        done
+    fi
+    rm -rf "$FP_TMP"
 else
     echo "  skipped (IHP sg13cmos5l PDK not found)"
 fi

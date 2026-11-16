@@ -9,6 +9,7 @@ Every netlist it produces is mathematically proven to behave like your Verilog b
 - **Synthesis:** Verilog in, a netlist of sg13cmos5l cells out, optimized for area or speed. Large memories become IHP SRAM macros automatically.
 - **Timing:** `lsta` reports setup, hold, worst paths and maximum clock speed for any gate-level netlist, including ones from Yosys or OpenLane. Its numbers match OpenSTA's.
 - **Verification:** a built-in SAT solver proves that two designs are equivalent, or shows an input where they differ.
+- **Physical design:** `fastpnr` floorplans, places and globally routes a netlist (die, rows, tracks, I/O pins, SRAMs, power grid, cell positions, route guides). It writes a DEF file that OpenROAD accepts. Detailed routing is next.
 
 How each step works is explained in [`src/`](src/README.md).
 
@@ -26,7 +27,7 @@ Build:
 make
 ```
 
-This creates two programs: `FastASIC` (synthesis and verification) and `lsta` (timing).
+This creates three programs: `FastASIC` (synthesis and verification), `lsta` (timing) and `fastpnr` (physical design).
 
 **The IHP PDK** is needed for anything that uses real cells. FastASIC looks for it in `~/ttsetup/pdk`, the folder Tiny Tapeout's setup creates. If yours is somewhere else, set `PDK_ROOT`:
 
@@ -63,13 +64,19 @@ Check the timing of any gate-level netlist:
 ./lsta -sdc constraints.sdc netlist.v
 ```
 
+Floorplan, place and globally route a cell netlist, and write the result as DEF plus route guides:
+
+```bash
+./fastpnr -o design.def -guide design.guide cells.v
+```
+
 Check whether two designs behave the same:
 
 ```bash
 ./FastASIC --equiv first.v second.v
 ```
 
-Run `./FastASIC` or `./lsta` with no arguments to see every option.
+Run `./FastASIC`, `./lsta` or `./fastpnr` with no arguments to see every option.
 
 ## Benchmarks
 
@@ -122,6 +129,47 @@ Run it yourself: `tools/compare_synth.sh` and `tools/compare_synth.sh bench/arit
 
 Run it yourself: `tools/compare_opensta.sh bench/sta/netlists/mac32.v bench/sta/default.sdc typ`
 
+### Floorplan against OpenROAD
+
+Both tools read the same netlist and do the same job: tie cells, die and rows, routing tracks, I/O pins and the same power grid (Metal1 rails, Metal4 and TopMetal1 straps). Times are best of three on `mac32` (6,490 cells), measured inside each program.
+
+| Check | fastpnr | OpenROAD |
+|---|---|---|
+| Whole run (read, floorplan, write DEF) | 66 ms | 285 ms: fastpnr 4.3× faster |
+| Floorplan step alone | 0.6 ms | 64 ms: fastpnr about 100× faster |
+| OpenROAD accepts fastpnr's DEF | placement, `check_placement`, `check_power_grid` on VDD and VSS, and global routing all pass, on 6 designs including two with SRAMs | |
+
+Run it yourself: `./fastpnr -no-place -o mac32.def bench/sta/netlists/mac32.v`, then `tools/check_def_openroad.sh mac32.def`
+
+### Placement against OpenROAD
+
+Both tools place the same floorplan. Wire length (HPWL) is measured by the same routine inside OpenROAD, and shorter is better. Times are measured inside each program.
+
+| Design | Cells | Wire length | Time: fastpnr vs OpenROAD |
+|---|---|---|---|
+| 16 × 16 multiplier | 1,480 | fastpnr 6.8% shorter | 123 vs 231 ms: 1.9× faster |
+| 32-bit multiply-accumulate | 6,490 | fastpnr 1.5% shorter | 584 vs 1,199 ms: 2.1× faster |
+| 8 × multiply-accumulate | 51,920 | fastpnr 17.8% shorter | 3.8 vs 10.9 s: 2.9× faster |
+| FIFO with a 2-port SRAM | 244 | fastpnr 4.2% shorter | 12 vs 91 ms: 7.6× faster |
+| buffer with a 1-port SRAM | 66 | fastpnr 46.8% shorter | 1 vs 533 ms |
+
+OpenROAD's own `check_placement` accepts every fastpnr placement.
+
+Run it yourself: `tools/compare_place_openroad.sh bench/sta/netlists/mac32.v`. The 51,920-cell design is 8 copies of mac32: `tools/replicate_netlist.py bench/sta/netlists/mac32.v 8 > mac32_x8.v`
+
+### Global routing against OpenROAD's FastRoute
+
+Both routers route fastpnr's placement on Metal2–Metal4, with the same 30% of tracks held back for detailed routing. Overflow means more wires than tracks somewhere, and 0 is what you need.
+
+| Design | Overflow (fastpnr / FastRoute) | Routed wire | Time: fastpnr vs FastRoute |
+|---|---|---|---|
+| 16 × 16 multiplier | 0 / 0 | fastpnr 1.6% less | 8 vs 199 ms: 26× faster |
+| 32-bit multiply-accumulate | 0 / 0 | fastpnr 1.9% less | 53 vs 492 ms: 9× faster |
+| 8 × multiply-accumulate | 0 / 0 | fastpnr 2.4% less | 1.2 vs 3.6 s: 3× faster |
+| FIFO with a 2-port SRAM | 0 / 0 | fastpnr 1.6% less | 9 vs 126 ms: 13× faster |
+
+Run it yourself: `tools/compare_groute_openroad.sh bench/sta/netlists/mac32.v`
+
 ### Equivalence checking against Yosys
 
 | Check | FastASIC | Yosys `sat` |
@@ -133,7 +181,7 @@ Run it yourself: `tools/bench_equiv.sh`
 
 ### What FastASIC does not do yet
 
-It stops at the gate-level netlist. Placement, routing and layout are still done by OpenROAD, which reads FastASIC's netlists directly. Power analysis is not implemented yet.
+It stops after global routing. Detailed routing and the final layout are still done by OpenROAD, which reads FastASIC's netlists and placed DEF files directly. Power analysis is not implemented yet.
 
 ## Licenses
 

@@ -4,3 +4,4 @@ tests/sta_bruteforce
 *.o
 tests/sat_fuzz
 /lsta
+/fastpnr
