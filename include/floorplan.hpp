@@ -19,6 +19,9 @@ struct FloorplanOptions {
     std::string rail_layer = "Metal1", strap_layer = "Metal4", top_layer = "TopMetal1";
     double rail_width = 0.44;     // um, Metal1 follow-pin rails along the rows
     double strap_width = 2.2, strap_pitch = 75.0;   // um, vertical Metal4 straps
+    // Width of the rail-to-strap via stacks: narrower than the strap, so their Metal2/Metal3 pads
+    // leave more of the tracks under each strap free for signal wiring (two cuts per layer still fit)
+    double rail_via_width = 0.96;
     double top_width = 3.2, top_pitch = 75.0;       // um, horizontal TopMetal1 straps
     std::string tie_lo = "sg13cmos5l_tielo", tie_hi = "sg13cmos5l_tiehi";
 };
@@ -66,6 +69,13 @@ struct FpSpecialWire {
     bool followpin = false;
 };
 
+// A filler cell (no netlist instance): fills a gap in a row so N-wells and implants stay continuous
+struct FpFiller {
+    const LefMacro* macro = nullptr;
+    Dbu x = 0, y = 0;
+    Orient orient = Orient::N;
+};
+
 struct FpVia {
     std::string name;
     std::vector<LefShape> shapes;   // relative to the via centre
@@ -80,6 +90,7 @@ struct Floorplan {
     std::vector<FpTracks> tracks;
     std::vector<FpPin> pins;
     std::vector<FpComponent> components;   // one per netlist instance, same order
+    std::vector<FpFiller> fillers;
     std::vector<FpVia> vias;
     std::vector<FpSpecialWire> special;
     std::vector<Rect> macro_blockages;     // macro outline plus halo
@@ -93,6 +104,9 @@ struct Floorplan {
 int insertTieCells(CellNetlist& netlist, const Library& lib, const std::string& tie_lo, const std::string& tie_hi);
 
 Floorplan buildFloorplan(const CellNetlist& netlist, const Lef& lef, const FloorplanOptions& options);
+
+// Fills every gap in every row with filler cells (widest first). Returns the number added.
+int insertFillers(Floorplan& fp, const Lef& lef, const std::vector<std::string>& filler_cells);
 
 // Consistency checks (pins on tracks and inside the die, rows inside the core and clear of
 // macros, ...). Returns the problems found; empty when the floorplan is sound.

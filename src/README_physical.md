@@ -1,12 +1,12 @@
 # Step 5: Physical design (floorplan → placement → routing)
 
-Files: `lef.cpp`, `floorplan.cpp`, `place.cpp`, `groute.cpp`, `def.cpp`, `fastpnr_main.cpp`.
-Check scripts: `tools/check_def_openroad.sh`, `tools/compare_place_openroad.sh`, `tools/compare_groute_openroad.sh`.
+Files: `lef.cpp`, `floorplan.cpp`, `place.cpp`, `groute.cpp`, `droute.cpp`, `def.cpp`, `fastpnr_main.cpp`.
+Check scripts: `tools/check_def_openroad.sh`, `tools/compare_place_openroad.sh`, `tools/compare_groute_openroad.sh`, `tools/compare_droute_openroad.sh`, `tools/drc_klayout.sh`, `tools/lvs_klayout.sh`.
 
-`fastpnr` turns a gate-level cell netlist into a physical design. **The floorplan, placement and global routing are done.** Detailed routing comes next.
+`fastpnr` turns a gate-level cell netlist into a routed layout. **The floorplan, placement, global routing and detailed routing (`-droute`) are done.** The routed designs pass IHP's own DRC and LVS decks, SRAM designs included.
 
 ```
-cell netlist + LEF ── floorplan ── global placement ── legalization ── detailed placement ── global routing ── DEF + route guides
+cell netlist + LEF ── floorplan ── placement ── fillers ── global routing ── detailed routing ── routed DEF
 ```
 
 ## The two file formats
@@ -112,6 +112,77 @@ All coordinates are integers in database units (1 nm for IHP). Cut layers withou
 
 **Output:** route guides in OpenROAD's format (`-guide FILE`), ready for a detailed router.
 
+## Detailed routing (`droute.cpp`, `-droute`)
+
+**Correct by construction.** Instead of creating violations and repairing them, the router only builds legal metal:
+- **The grid.** Nodes sit where the Metal2/Metal4 tracks (every 0.48 µm) cross the Metal1/Metal3 tracks (every 0.42 µm). Wires run only along tracks, at minimum width, in each layer's direction. The track pitches already give side-by-side spacing.
+- **Vias.** Only the PDK's single-cut vias whose pads lie along each layer's direction are used: Via1_XY or Via1_YY, Via2_YX and Via3_XY. So pads on neighbouring tracks never touch.
+- **End-of-line spacing.** Two different nets never use neighbouring nodes of the same track. This one rule covers spacing at wire ends and between via pads.
+- **Obstacles.** The power grid and macros block every node whose wire or pad would come too close, using the widest-wire spacing.
+- **Pins.** Metal around an I/O or macro pin is reserved for that pin's net.
+
+**Standard-cell pin access**, computed once per cell master and orientation (84 masters × 2):
+1. **On-grid points** whose Via1 pad lies inside the pin.
+2. **If none: off-grid.** A via with its pad inside the pin, placed between two grid rows and/or up to 0.06 µm beside a Metal2 track. That is the most that still keeps spacing to the neighbouring tracks. A Metal2 patch covering the via pad and the node joins it to the track.
+   - The node on the other side of the via, which the pad reaches towards, is reserved. Where an obstacle already blocks that node, the real distance from the pad to the obstacle is checked instead.
+   - Where another pin reserved the same node, it becomes a *soft* claim that negotiation resolves. A reserved node is never metal, so its neighbours stay free.
+3. **Last resort:** a pad that overlaps the pin. It must keep Metal1 spacing from all other shapes, and must not leave a notch against other parts of the same pin.
+4. **Compatible set.** The pins of a cell get access points at least a pad height plus spacing apart on any one Metal2 track. Pins with the fewest options choose first (TritonRoute calls this a pin-access pattern).
+
+**SRAM pin escapes.** IHP's SRAM pins are 0.26 µm Metal2 squares on the macro's bottom edge, as little as 0.51 µm apart. That doesn't fit the 0.48 µm tracks, so no on-track wire can reach them legally. Each pin gets an escape instead:
+- a Metal2 stub straight down from the pin centre, off-track (stubs 0.51 µm apart keep 0.31 µm spacing)
+- a Via2 on a Metal3 row below the macro
+- a Metal3 patch along the row to the nearest node, which becomes the pin's terminal
+
+Neighbouring pins take different rows ("levels"), assigned left to right so that no two nets' Metal3 comes within spacing. Metal2 nodes near a stub are blocked for every net.
+
+**Routing.**
+- A* search on the 3D grid, from the whole tree of the net built so far, cheap inside the global-route guides and three times as expensive outside them.
+- The estimate is weighted ×1.2. On mac32 that halves the search time (17.5 s → 8.4 s) for 0.2% more wire.
+- Conflicts are resolved by negotiation (PathFinder): history and present-congestion costs on nodes, ripping up only the conflicting nets.
+- **When negotiation stalls for 3 rounds**, every net within 3 nodes of a conflict is ripped up as well, so the neighbours the conflicting nets would have to squeeze past can move too.
+
+**Three choices that keep it fast on dense designs:**
+- **Certify the leftovers instead of exact rules everywhere.** The search keeps the cautious rule (no two nets on neighbouring nodes of a track). Only the conflicts left at the end of a round are measured against real geometry:
+  - a wire end reaches half a width past its node, a via pad half a pad length
+  - a pair whose gap still meets the layer's spacing is accepted: on Metal3 two wire ends, or a pad and a wire end; on Metal2/Metal4 two wire ends
+
+  Easy designs end with no conflicts, so they pay nothing.
+- **Short wrong-way jogs.** A hop to the next track on the same layer costs 2.5× its length. It replaces a two-via detour over the other layer: vias drop about 20%, and negotiation needs about half the rounds.
+- **Wires as wide as the via pads.** Via2/Via3 bottom pads are 0.21 µm wide against a 0.20 µm minimum wire. Metal2/Metal3 are drawn 0.21 µm wide (a DEF non-default rule), so wires and pads never form 5 nm steps. The spacing still holds: 0.27 µm on Metal2, exactly 0.21 µm on Metal3.
+
+A stalled negotiation also reroutes the nets within a few nodes of each conflict (at most 5) and raises the history cost there, so nets passing through a stuck spot move away. Following global routing's layer choices was tried and added vias, so it is off.
+
+**Finishing.**
+- Same-net nodes next to each other are joined.
+- Short wire pieces are extended to the minimum-area rule.
+- Two pieces of one net on a track that come closer than the spacing (via pads and off-grid patches alike) are bridged at pad width, so no notch is left.
+- Filler cells close every gap in the rows, keeping the N-wells legal.
+- Top-level VDD and VSS pins go on the TopMetal1 straps.
+
+**Checks.**
+1. **Our own:** conflicts, plus opens found by union-find over every net.
+2. **`tools/drc_klayout.sh`:** the DEF becomes GDS with the real cell and SRAM layouts and goes through **IHP's KLayout DRC deck**.
+3. **`tools/lvs_klayout.sh`: IHP's KLayout LVS deck.** It extracts every transistor from the layout and compares the circuit with a schematic built from the DEF and the cells' CDL. A match means no opens and no shorts.
+   - The PDK's own SRAM GDS and CDL don't compare clean with this deck even on their own, so SRAMs are black boxes there.
+   - Each SRAM pin is instead probed in the extracted metal: it must share a net with another pin of its net, and with no other net.
+   - A planted open (one via removed) is caught by both parts.
+
+**Results:**
+- **Every synthesized test design routes completely (47 of 47):** 0 conflicts, 0 opens, every pin reached.
+- **IHP's DRC deck:** 0 violations on acc16, add64, mul16, mac32, mul8, shifters, alu4, cpu_like, sram_buffer and fifo_2p. Metal density is set aside, since there is no fill yet.
+- **IHP's LVS deck:** match on acc16, add64, mul16, mac32, sram_buffer and fifo_2p. The SRAM pins are clean too: 52 and 108 pins probed, no opens or shorts.
+
+Full-flow benchmarks, OpenROAD on 16 threads, are in the main README (`tools/benchmark_flow.sh`). The older one-thread-each comparison below (`tools/compare_droute_openroad.sh`, before the three choices above):
+
+| Design | Time | IHP DRC | Wire | Vias |
+|---|---|---|---|---|
+| mul16 (1,514 nets) | fastpnr 1.3 s, TritonRoute 251 s: **190× faster** | 0 / 0 | fastpnr +2.0% | fastpnr +24% |
+| mac32 (6,556 nets) | fastpnr 8.1 s, TritonRoute 1,116 s (18.6 min): **138× faster** | 0 / 0 | fastpnr +1.3% | fastpnr +24% |
+
+Both layouts are judged by the same IHP KLayout DRC deck, and fastpnr's also passes LVS.
+TritonRoute uses fewer vias and slightly less wire. Part of the difference is that it also routes on Metal1. fastpnr never does, so every pin costs a Via1 and every turn a via. Raising our via cost barely changes the count.
+
 ## Independent check by OpenROAD
 
 `tools/check_def_openroad.sh design.def` loads our DEF into OpenROAD (docker image `openlane2:2.3.10`) and runs:
@@ -143,7 +214,7 @@ Same floorplan for both tools; wire length is measured by the same routine insid
 | sram_buffer (1P SRAM) | 66 | −46.8% | 1 vs 533 ms | 0 / 0 | −0.4% | 4 vs 147 ms |
 | mac32_x8 | 51,920 | −17.8% | 3.8 vs 10.9 s | 0 / 0 | −2.4% | 1.2 vs 3.6 s |
 
-Lower HPWL is not yet proof of a better layout. Detailed routing and timing will decide that.
+Lower HPWL is not by itself proof of a better layout. Detailed routing (above) and timing decide that.
 
 ## Speed
 
@@ -153,5 +224,7 @@ OpenROAD takes 285 ms in total and 64 ms for the floorplan step itself. Its run 
 
 ## Next
 
-- Detailed routing from the guides. The GPU will route batches of nets whose bounding boxes do not overlap, one thread block per net.
+- Fewer vias: short Metal1 connections inside and between neighbouring cells.
+- GPU routing: batches of nets whose bounding boxes do not overlap, one thread block per net. This needs the CUDA toolkit.
 - Extraction (SPEF) and timing-driven routing with lsta.
+- Metal fill for the density rules, and GDS output.

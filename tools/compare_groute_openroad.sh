@@ -11,6 +11,7 @@ NETLIST=$(realpath "$1")
 ADJ=${2:-0.3}
 IMAGE=${OPENLANE_IMAGE:-ghcr.io/efabless/openlane2:2.3.10}
 PDK_DIR=${PDK_ROOT:-$HOME/ttsetup/pdk}
+THREADS=${OPENROAD_THREADS:-$(nproc)}   # OpenROAD runs on all threads (fastpnr: one)
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
 
@@ -25,6 +26,7 @@ done
 cat > "$TMP/run.tcl" <<EOF
 $LEFS
 read_def /w/placed.def
+set_thread_count $THREADS
 set_routing_layers -signal Metal2-Metal4
 set_global_routing_layer_adjustment Metal2-Metal4 $ADJ
 set t0 [clock milliseconds]
@@ -46,5 +48,5 @@ tot = re.search(r'Total\s+(\d+)\s+(\d+)\s+[\d.]+%\s+(\d+)\s*/\s*(\d+)\s*/\s*(\d+
 or_dem, or_ovf = int(tot.group(2)), int(tot.group(5))
 or_ms = float(re.search(r'GRTIME (\d+)', orl).group(1))
 print(f"{name}: overflow fastpnr {our_ovf}, FastRoute {or_ovf}; routed demand (gcell edges) fastpnr {our_dem}, FastRoute {or_dem} ({(our_dem / or_dem - 1) * 100:+.1f}%)")
-print(f"  routing time fastpnr {our_ms:.0f} ms ({our_rounds} negotiation rounds), FastRoute {or_ms:.0f} ms: {or_ms / max(our_ms, 1e-3):.1f}x")
+print(f"  routing time fastpnr {our_ms:.0f} ms (1 thread, {our_rounds} negotiation rounds), FastRoute {or_ms:.0f} ms (all threads): {or_ms / max(our_ms, 1e-3):.1f}x")
 PY

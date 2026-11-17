@@ -193,7 +193,7 @@ fi
 
 PNR=$(dirname "$BIN")/fastpnr
 echo "Physical design (fastpnr: floorplan, placement, global routing; every result self-checked;"
-echo "OpenROAD also checks the floorplans with FASTASIC_OPENROAD=1):"
+echo "OpenROAD also checks the floorplans with FASTASIC_OPENROAD=1, IHP's DRC and LVS decks the routes with FASTASIC_SIGNOFF=1):"
 if [ -f "$PDK_LIB" ] && [ -x "$PNR" ]; then
     FP_TMP=$(mktemp -d)
     # a 52k-cell design: 8 copies of mac32 (generated, too large to keep in the repo)
@@ -208,6 +208,27 @@ if [ -f "$PDK_LIB" ] && [ -x "$PNR" ]; then
         "$BIN" -q --map area -o "$FP_TMP/$(basename "$f" .v).cells.v" "$f" > /dev/null 2>&1
         check "$(basename "$f"): synthesized, then placed and routed" 0 "2D overflow 0" "$PNR" -o "$FP_TMP/$(basename "$f" .v).def" "$FP_TMP/$(basename "$f" .v).cells.v"
     done
+    for f in "$DIR"/lang/shifters.v "$DIR"/../bench/arith/mul8.v; do
+        "$BIN" -q --map area -o "$FP_TMP/$(basename "$f" .v).dr.cells.v" "$f" > /dev/null 2>&1
+        check "$(basename "$f"): detailed routing, no conflicts or opens" 0 "0 conflicts, 0 unconnected nets, 0 pins without access" "$PNR" -droute -o "$FP_TMP/$(basename "$f" .v).routed.def" "$FP_TMP/$(basename "$f" .v).dr.cells.v"
+    done
+    for d in acc16 add64 mul16 sram_buffer fifo_2p; do
+        check "$d.v: detailed routing, every pin reached (SRAM escapes too), no conflicts or opens" 0 "0 conflicts, 0 unconnected nets, 0 pins without access" \
+            "$PNR" -droute -o "$FP_TMP/$d.routed.def" "$DIR/../bench/sta/netlists/$d.v"
+    done
+    if [ "${FASTASIC_SIGNOFF:-0}" = 1 ]; then
+        for d in acc16 sram_buffer fifo_2p; do
+            check "$d: IHP KLayout DRC deck, 0 violations" 0 "DRC violations (excluding metal density): 0" bash "$DIR/../tools/drc_klayout.sh" "$FP_TMP/$d.routed.def"
+            check "$d: IHP KLayout LVS deck matches (SRAM pins probed)" 0 "netlists match" bash "$DIR/../tools/lvs_klayout.sh" "$FP_TMP/$d.routed.def"
+        done
+        # planted bug: one Via1 removed must be caught
+        python3 - "$FP_TMP/acc16.routed.def" "$FP_TMP/acc16.broken.def" <<'PY'
+import sys
+t = open(sys.argv[1]).read(); i = t.index('\nNETS '); j = t.index('Via1_', i)
+open(sys.argv[2], 'w').write(t[:t.rindex('\n', 0, j)] + t[t.index('\n', j):])
+PY
+        check "LVS catches a planted open (one via removed)" 1 "MISMATCH" bash "$DIR/../tools/lvs_klayout.sh" "$FP_TMP/acc16.broken.def"
+    fi
     check "route guides written for every routed net" 0 "Metal3" bash -c "'$PNR' -q -guide '$FP_TMP/mul16.guide' '$DIR/../bench/sta/netlists/mul16.v' && grep -c '^(' '$FP_TMP/mul16.guide' > /dev/null && head -5 '$FP_TMP/mul16.guide'"
     check "tie cells replace constant inputs (fifo_2p)" 0 "86 tie cells added" "$PNR" "$DIR/../bench/sta/netlists/fifo_2p.v"
     check "fixed die too small for the cells" 1 "do not fit in the rows" "$PNR" -die 60 60 "$DIR/../bench/sta/netlists/mul16.v"

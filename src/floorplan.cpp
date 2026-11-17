@@ -557,7 +557,7 @@ Floorplan buildFloorplan(const CellNetlist& nl, const Lef& lef, const FloorplanO
                 for (const Strap& s : straps) {
                     if (s.net != r.net || s.c - stw / 2 < r.x.lo || s.c + stw / 2 > r.x.hi) continue;
                     if (r.y - rw / 2 < s.span.lo || r.y + rw / 2 > s.span.hi) continue;
-                    auto stack = viaFor(rl, sl, stw, rw);
+                    auto stack = viaFor(rl, sl, std::min(stw, roundUp(um(opt.rail_via_width), 2 * grid)), rw);
                     if (stack.empty()) { missing++; continue; }
                     addVia(r.net, stack, s.c, r.y);
                 }
@@ -596,6 +596,39 @@ Floorplan buildFloorplan(const CellNetlist& nl, const Lef& lef, const FloorplanO
         }
     }
     return fp;
+}
+
+int insertFillers(Floorplan& fp, const Lef& lef, const std::vector<std::string>& names) {
+    std::vector<const LefMacro*> fills;
+    for (const auto& n : names) if (const LefMacro* m = lef.findMacro(n)) fills.push_back(m);
+    std::sort(fills.begin(), fills.end(), [](const LefMacro* a, const LefMacro* b) { return a->width > b->width; });
+    if (fills.empty()) return 0;
+    fp.fillers.clear();
+    const Dbu sw = fp.site->width;
+    std::map<Dbu, std::vector<std::pair<Dbu, Dbu>>> used;   // row y -> occupied x intervals
+    for (const FpComponent& c : fp.components) {
+        if (c.placed && !c.fixed) used[c.y].push_back({c.x, c.x + c.macro->width});
+    }
+    for (const FpRow& r : fp.rows) {
+        auto& cells = used[r.y];
+        std::sort(cells.begin(), cells.end());
+        Dbu x = r.x, end = r.x + static_cast<Dbu>(r.count) * sw;
+        auto fill = [&](Dbu from, Dbu to) {
+            for (const LefMacro* m : fills) {
+                while (from + m->width <= to) {
+                    fp.fillers.push_back({m, from, r.y, r.orient});
+                    from += m->width;
+                }
+            }
+        };
+        for (const auto& [a, b] : cells) {
+            if (b <= r.x || a >= end) continue;
+            if (a > x) fill(x, a);
+            x = std::max(x, b);
+        }
+        if (x < end) fill(x, end);
+    }
+    return static_cast<int>(fp.fillers.size());
 }
 
 std::vector<std::string> checkFloorplan(const Floorplan& fp, const CellNetlist& nl, const Lef& lef) {

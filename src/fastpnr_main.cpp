@@ -2,6 +2,7 @@
 #include "../include/cell_netlist.hpp"
 #include "../include/def.hpp"
 #include "../include/floorplan.hpp"
+#include "../include/droute.hpp"
 #include "../include/groute.hpp"
 #include "../include/lef.hpp"
 #include "../include/place.hpp"
@@ -35,6 +36,7 @@ int usage() {
               << "  -density D       placement target density, 0..1 (default 0.6)\n"
               << "  -no-detailed     skip detailed placement\n"
               << "  -no-route        no global routing\n"
+              << "  -droute          detailed routing too (wires and vias go into the DEF)\n"
               << "  -guide FILE      write the global route guides (OpenROAD format)\n"
               << "  -adjust A        fraction of tracks held back for detailed routing (default 0.3)\n"
               << "  -gcell N         gcell size in tracks (default 15)\n"
@@ -64,7 +66,7 @@ int main(int argc, char* argv[]) {
     std::vector<std::string> lefs;
     std::string netlist_path, out_path;
     FloorplanOptions opt;
-    bool quiet = false, place = true, route = true;
+    bool quiet = false, place = true, route = true, droute = false;
     PlaceOptions popt;
     GrouteOptions gopt;
     std::string guide_path;
@@ -89,6 +91,7 @@ int main(int argc, char* argv[]) {
             else if (a == "-density" && v) popt.target_density = std::stod(argv[++i]);
             else if (a == "-no-detailed") popt.detailed = false;
             else if (a == "-no-route") route = false;
+            else if (a == "-droute") droute = true;
             else if (a == "-guide" && v) guide_path = argv[++i];
             else if (a == "-adjust" && v) gopt.adjustment = std::stod(argv[++i]);
             else if (a == "-gcell" && v) gopt.gcell_tracks = std::stoi(argv[++i]);
@@ -146,6 +149,7 @@ int main(int argc, char* argv[]) {
         if (place && problems.empty()) {
             pr = placeDesign(fp, netlist, lef, popt);
             for (const auto& p : checkPlacement(fp, netlist, lef)) problems.push_back(p);
+            insertFillers(fp, lef, {"sg13cmos5l_fill_8", "sg13cmos5l_fill_4", "sg13cmos5l_fill_2", "sg13cmos5l_fill_1"});
         }
         auto t3b = std::chrono::steady_clock::now();
         GrouteResult gr;
@@ -159,11 +163,26 @@ int main(int argc, char* argv[]) {
             }
         }
         auto t3c = std::chrono::steady_clock::now();
+        DrouteResult dr;
+        bool detailed = routed && droute;
+        if (detailed) {
+            DrouteOptions dopt;
+            if (const char* w = std::getenv("FASTPNR_ASTAR_WEIGHT")) dopt.astar_weight = std::atof(w);
+            if (const char* v = std::getenv("FASTPNR_VIA_COST")) dopt.via_cost = std::atof(v);
+            if (const char* v = std::getenv("FASTPNR_OTHER_LAYER")) dopt.other_layer = std::atof(v);
+            if (const char* v = std::getenv("FASTPNR_ACCESS_PENALTY")) dopt.access_penalty = std::atof(v);
+            if (const char* v = std::getenv("FASTPNR_TOP_VIA")) dopt.top_via_factor = std::atof(v);
+            if (const char* v = std::getenv("FASTPNR_WRONG_WAY")) dopt.wrong_way = std::atof(v);
+            dr = detailedRoute(fp, netlist, lef, gr, dopt);
+            if (dr.conflicts) problems.push_back(std::to_string(dr.conflicts) + " detailed-routing conflicts left (shorts or spacing)");
+            if (dr.unrouted) problems.push_back(std::to_string(dr.unrouted) + " nets not fully connected");
+        }
+        auto t3d = std::chrono::steady_clock::now();
 
         if (!out_path.empty()) {
             std::ofstream out(out_path);
             if (!out) throw std::runtime_error("cannot write " + out_path);
-            writeDef(out, fp, netlist, lef);
+            writeDef(out, fp, netlist, lef, detailed ? &dr : nullptr);
         }
         auto t4 = std::chrono::steady_clock::now();
 
@@ -187,6 +206,7 @@ int main(int argc, char* argv[]) {
                       << "Power grid  " << wires << " wires, " << vias << " vias, " << fp.vias.size() << " via types\n";
             for (const auto& n : fp.notes) std::cout << "Note        " << n << "\n";
             if (place && problems.empty()) {
+                std::cout << std::setprecision(0) << "Fillers     " << fp.fillers.size() << " filler cells close the gaps between cells\n";
                 std::cout << std::setprecision(0) << "Placement   HPWL " << pr.hpwl_global << " um global (" << pr.iterations << " iterations), " << pr.hpwl_legal
                           << " legalized, " << pr.hpwl_final << " detailed\n"
                           << std::setprecision(2) << "            legalization moved cells " << pr.avg_displacement << " um on average, " << pr.max_displacement
@@ -206,6 +226,14 @@ int main(int argc, char* argv[]) {
                 std::cout << "            Total            " << std::setw(19) << tr << std::setw(9) << td << std::setw(6) << std::setprecision(1)
                           << (tr ? 100.0 * td / tr : 0.0) << "%" << std::setw(9) << to << "\n"
                           << std::setprecision(0) << "            wirelength " << gr.wirelength_um << " um, " << gr.vias << " vias, 2D overflow " << gr.overflow_2d << "\n";
+            }
+            if (detailed) {
+                std::cout << std::setprecision(0) << "Detailed    " << dr.nets.size() << " nets, " << dr.wirelength_um << " um of wire, " << dr.vias << " vias, "
+                          << dr.iterations << " negotiation rounds; " << dr.conflicts << " conflicts, " << dr.unrouted << " unconnected nets, "
+                          << dr.pins_without_access << " pins without access, min-area fixes " << dr.min_area_fixes << " (" << dr.min_area_left << " left)\n"
+                          << std::setprecision(1) << "            time " << ms(t3c, t3d) << " ms (setup " << dr.ms_setup << ", route " << dr.ms_route << ", finish "
+                          << dr.ms_finish << ")\n";
+                for (const auto& n : dr.notes) std::cout << "Note        " << n << "\n";
             }
             std::cout << std::setprecision(1) << "Time        " << ms(t0, t4) << " ms (LEF " << ms(t0, t1) << ", netlist " << ms(t1, t2) << ", floorplan "
                       << ms(t2, t3) << ", placement " << ms(t3, t3b) << " [global " << pr.ms_global << ", legal " << pr.ms_legal << ", detailed "

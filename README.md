@@ -9,7 +9,7 @@ Every netlist it produces is mathematically proven to behave like your Verilog b
 - **Synthesis:** Verilog in, a netlist of sg13cmos5l cells out, optimized for area or speed. Large memories become IHP SRAM macros automatically.
 - **Timing:** `lsta` reports setup, hold, worst paths and maximum clock speed for any gate-level netlist, including ones from Yosys or OpenLane. Its numbers match OpenSTA's.
 - **Verification:** a built-in SAT solver proves that two designs are equivalent, or shows an input where they differ.
-- **Physical design:** `fastpnr` floorplans, places and globally routes a netlist (die, rows, tracks, I/O pins, SRAMs, power grid, cell positions, route guides). It writes a DEF file that OpenROAD accepts. Detailed routing is next.
+- **Physical design:** `fastpnr` floorplans, places and routes a netlist (die, rows, tracks, I/O pins, SRAMs, power grid, every wire and via). The routed layouts pass IHP's own design-rule (DRC) and layout-versus-schematic (LVS) checks.
 
 How each step works is explained in [`src/`](src/README.md).
 
@@ -64,10 +64,20 @@ Check the timing of any gate-level netlist:
 ./lsta -sdc constraints.sdc netlist.v
 ```
 
-Floorplan, place and globally route a cell netlist, and write the result as DEF plus route guides:
+Floorplan, place and route a cell netlist, and write the routed layout as DEF:
 
 ```bash
-./fastpnr -o design.def -guide design.guide cells.v
+./fastpnr -droute -o design.def cells.v
+```
+
+Check the result with IHP's own rule decks (needs docker):
+
+```bash
+tools/drc_klayout.sh design.def
+```
+
+```bash
+tools/lvs_klayout.sh design.def
 ```
 
 Check whether two designs behave the same:
@@ -170,6 +180,43 @@ Both routers route fastpnr's placement on Metal2–Metal4, with the same 30% of 
 
 Run it yourself: `tools/compare_groute_openroad.sh bench/sta/netlists/mac32.v`
 
+### Detailed routing against OpenROAD's TritonRoute
+
+An earlier measurement, with **both routers on one thread** and before the router's latest improvements; the full-flow ALU benchmark below gives OpenROAD all 16 threads. Both routers route the same placement on Metal2–Metal4, and both results are checked with IHP's own design-rule deck, fastpnr's also with IHP's LVS deck (no opens, no shorts).
+
+| Design | fastpnr | TritonRoute | Design-rule violations (fastpnr / TritonRoute) |
+|---|---|---|---|
+| 16 × 16 multiplier, 1,514 nets | 1.3 s | 251 s: fastpnr 190× faster | 0 / 0 |
+| 32-bit multiply-accumulate, 6,556 nets | 8.1 s | 18.6 min: fastpnr 138× faster | 0 / 0 |
+
+TritonRoute's layouts use 1–2% less wire and about 20% fewer vias.
+
+Run it yourself: `tools/compare_droute_openroad.sh bench/sta/netlists/mul16.v`
+
+### Full flow on a real design: a 64-bit vector ALU
+
+`bench/flow/alu.v`, one ALU lane of a user's GPU project, is mostly a 64 × 64 multiplier (about 8,000–13,000 cells). FastASIC is compared with Yosys + ABC for synthesis and with OpenROAD for routing, on the same netlist and placement. fastpnr uses 1 thread and OpenROAD 16.
+
+| | Area-optimised | Speed-optimised (`--map delay`) |
+|---|---|---|
+| Synthesis: FastASIC vs Yosys + ABC | 10.9 s vs 31.9 s: **2.9× faster**, 29% smaller | 17.1 s vs 36.5 s: **2.1× faster**, 3% smaller |
+| Routing: fastpnr vs OpenROAD | 35.5 s vs 575 s: **16× faster** | 119 s vs 753 s: **6.3× faster** |
+| Design-rule violations (IHP deck), both tools | 0 | 0 |
+| Wire and vias vs OpenROAD | 0.9% less wire, 6.5% fewer vias | 1.8% less wire, 6.4% fewer vias |
+| Fastest clock after routing, slow corner | 36.9 MHz vs 36.5 MHz | 47.2 MHz vs 46.7 MHz |
+
+The clock speeds come from OpenROAD's own extraction (OpenRCX) and timing (OpenSTA) on both layouts, so the same tools judge both.
+
+Run it yourself (about 15 minutes; OpenROAD's routing is the slow part):
+
+```bash
+tools/benchmark_flow.sh bench/flow/alu.v --period 17.6
+```
+
+```bash
+tools/benchmark_flow.sh bench/flow/alu.v --map delay --period 17.6
+```
+
 ### Equivalence checking against Yosys
 
 | Check | FastASIC | Yosys `sat` |
@@ -181,7 +228,7 @@ Run it yourself: `tools/bench_equiv.sh`
 
 ### What FastASIC does not do yet
 
-It stops after global routing. Detailed routing and the final layout are still done by OpenROAD, which reads FastASIC's netlists and placed DEF files directly. Power analysis is not implemented yet.
+Routing is not timing-driven yet, and there is no metal fill or GDS output: OpenROAD or KLayout finish the layout from FastASIC's routed DEF. Power analysis is not implemented yet.
 
 ## Licenses
 

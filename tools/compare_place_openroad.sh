@@ -13,6 +13,7 @@ NETLIST=$(realpath "$1")
 DENSITY=${2:-0.6}
 IMAGE=${OPENLANE_IMAGE:-ghcr.io/efabless/openlane2:2.3.10}
 PDK_DIR=${PDK_ROOT:-$HOME/ttsetup/pdk}
+THREADS=${OPENROAD_THREADS:-$(nproc)}   # OpenROAD runs on all threads (fastpnr: one)
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
 
@@ -52,6 +53,7 @@ cat > "$TMP/openroad.tcl" <<EOF
 $LEFS
 $HPWL
 read_def /w/fp.def
+set_thread_count $THREADS
 set t0 [clock milliseconds]
 global_placement -density $DENSITY -skip_io
 set t1 [clock milliseconds]
@@ -76,6 +78,6 @@ import sys
 orh, ourh, gp, dp, ours_ms, check, name = sys.argv[1:]
 orh, ourh, gp, dp, ours_ms = float(orh), float(ourh), float(gp), float(dp), float(ours_ms)
 print(f"{name}: HPWL fastpnr {ourh:.0f} um, OpenROAD {orh:.0f} um ({(ourh / orh - 1) * 100:+.1f}%)")
-print(f"  placement time fastpnr {ours_ms:.0f} ms, OpenROAD {gp + dp:.0f} ms (global {gp:.0f} + detailed {dp:.0f}): {(gp + dp) / max(ours_ms, 1e-3):.1f}x")
+print(f"  placement time fastpnr {ours_ms:.0f} ms (1 thread), OpenROAD {gp + dp:.0f} ms (global {gp:.0f} + detailed {dp:.0f}, all threads): {(gp + dp) / max(ours_ms, 1e-3):.1f}x")
 print(f"  OpenROAD check_placement on fastpnr's result: {check}")
 PY
