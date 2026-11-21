@@ -1,4 +1,5 @@
 #include "../include/timer.hpp"
+#include "../include/spef.hpp"
 #include <algorithm>
 #include <array>
 #include <chrono>
@@ -54,6 +55,7 @@ class Timer {
     std::vector<int> net_driver;
     std::vector<std::vector<int>> net_loads;
     std::vector<std::array<double, 4>> net_cap;   // [edge * 2 + mm], mm 0 = max (late), 1 = min (early)
+    std::vector<std::array<double, 4>> wire_delay; // per load node, with the same edge/corner indexing
     std::vector<std::vector<Arc>> fanin, fanout;   // cell arcs by output / input node
     std::vector<std::vector<Arc>> checks;          // by data node: from = clock pin node
     std::vector<int> order;
@@ -137,6 +139,8 @@ class Timer {
         net_driver.assign(nl.netCount(), -1);
         net_loads.assign(nl.netCount(), {});
         net_cap.assign(nl.netCount(), {0.0, 0.0, 0.0, 0.0});
+        wire_delay.assign(n_nodes, {0.0, 0.0, 0.0, 0.0});
+        std::vector<std::array<double, 4>> pin_cap(n_nodes, {0.0, 0.0, 0.0, 0.0});
         fanin.assign(n_nodes, {});
         fanout.assign(n_nodes, {});
         checks.assign(n_nodes, {});
@@ -156,6 +160,7 @@ class Timer {
                 net_loads[node.net].push_back(static_cast<int>(n));
                 if (node.kind == NodeKind::PIN_IN) {
                     const LibPin& pin = nl.instances[node.inst].cell->pins[node.pin];
+                    pin_cap[n] = {pin.rise_cap_max, pin.rise_cap_min, pin.fall_cap_max, pin.fall_cap_min};
                     net_cap[node.net][RISE * 2 + 0] += pin.rise_cap_max;
                     net_cap[node.net][RISE * 2 + 1] += pin.rise_cap_min;
                     net_cap[node.net][FALL * 2 + 0] += pin.fall_cap_max;
@@ -172,7 +177,29 @@ class Timer {
             }
             int net = nl.port_bits[p].net;
             if (net > CellNetlist::kConst1) {
+                pin_cap[p].fill(load);
                 for (double& c : net_cap[net]) c += load;
+            }
+        }
+        // Extracted wire capacitance from SPEF (added to every corner/edge load of that net)
+        if (options.spef) {
+            for (size_t n = 2; n < nl.netCount(); ++n) {
+                auto it = options.spef->nets.find(nl.net_names[n]);
+                if (it != options.spef->nets.end()) {
+                    const NetParasitics& np = it->second;
+                    for (int corner = 0; corner < 4; ++corner) {
+                        std::unordered_map<std::string, double> loads;
+                        for (int p : net_loads[n]) loads[nodeName(p)] = pin_cap[p][corner];
+                        auto delays = np.elmoreDelays(loads);
+                        for (int p : net_loads[n]) {
+                            auto d = delays.find(nodeName(p));
+                            wire_delay[p][corner] = d != delays.end() ? d->second
+                                : np.default_elmore_ps + np.wire_res_ohm * net_cap[n][corner] * 1e-3;
+                        }
+                    }
+                    double wc = np.wire_cap_ff;
+                    for (double& c : net_cap[n]) c += wc;
+                }
             }
         }
 
@@ -414,12 +441,13 @@ class Timer {
                 int d = net_driver[node.net];
                 if (d < 0) continue;
                 double convert = slew_frac[n] / slew_frac[d];   // 1 unless the libraries differ
-                for (Edge e : kEdges) {   // ideal wire: same arrival and slew as the driver
+                for (Edge e : kEdges) {
                     size_t i = static_cast<size_t>(n) * 2 + e, j = static_cast<size_t>(d) * 2 + e;
-                    arr_max[i] = arr_max[j];
-                    arr_min[i] = arr_min[j];
-                    slew_max[i] = slew_max[j] * convert;
-                    slew_min[i] = slew_min[j] < kInf ? slew_min[j] * convert : kInf;
+                    double dmax = wire_delay[n][e * 2], dmin = wire_delay[n][e * 2 + 1];
+                    arr_max[i] = arr_max[j] > -kInf ? arr_max[j] + dmax : -kInf;
+                    arr_min[i] = arr_min[j] < kInf ? arr_min[j] + dmin : kInf;
+                    slew_max[i] = std::hypot(slew_max[j], 2.2 * dmax) * convert;
+                    slew_min[i] = slew_min[j] < kInf ? std::hypot(slew_min[j], 2.2 * dmin) * convert : kInf;
                     pred_max[i] = pred_min[i] = static_cast<int>(j);
                 }
                 continue;

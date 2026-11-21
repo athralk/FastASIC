@@ -3,12 +3,14 @@
 #include "../include/clock_tree.hpp"
 #include "../include/liberty.hpp"
 #include "../include/sdc.hpp"
+#include "../include/spef.hpp"
 #include "../include/timer.hpp"
 #include <chrono>
 #include <cstdlib>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <sstream>
 
 namespace {
 
@@ -25,6 +27,7 @@ int usage() {
               << "  -q               summary only, no path reports\n"
               << "  -cts BUF         build a balanced clock buffer tree from cell BUF before timing\n"
               << "  -cts_fanout N    max fanout per clock buffer (default 8)\n"
+              << "  -spef FILE       post-route SPEF wire parasitics (wire C + Elmore RC delay)\n"
               << "  -write FILE      write the (clock-tree) netlist as structural Verilog\n";
     return 2;
 }
@@ -44,7 +47,7 @@ double ms(std::chrono::steady_clock::time_point a, std::chrono::steady_clock::ti
 
 int main(int argc, char* argv[]) {
     std::vector<std::string> libs;
-    std::string sdc_path, netlist_path, endpoints_path, corner = "typ";
+    std::string sdc_path, spef_path, netlist_path, endpoints_path, corner = "typ";
     double period = 10000;
     TimerOptions options;
     bool quiet = false;
@@ -63,6 +66,7 @@ int main(int argc, char* argv[]) {
             else if (a == "-q") quiet = true;
             else if (a == "-cts" && v) cts_buffer = argv[++i];
             else if (a == "-cts_fanout" && v) cts_fanout = std::stoi(argv[++i]);
+            else if (a == "-spef" && v) spef_path = argv[++i];
             else if (a == "-write" && v) write_path = argv[++i];
             else if (!a.empty() && a[0] == '-') return usage();
             else netlist_path = a;
@@ -119,16 +123,23 @@ int main(int argc, char* argv[]) {
             writeCellNetlist(out, netlist);
         }
         auto t3 = std::chrono::steady_clock::now();
+        SpefData spef_data;
+        if (!spef_path.empty()) {
+            spef_data = readSpef(spef_path);
+            options.spef = &spef_data;
+        }
 
         TimingResult result = analyzeNetlistTiming(netlist, lib, sdc, options);
         if (quiet) {
             result.setup_paths.clear();
             result.hold_paths.clear();
         }
-        std::cout << "lsta: " << netlist_path << " with " << lib.name << "\n";
+        std::cout << "lsta: " << netlist_path << " with " << lib.name
+                  << (spef_path.empty() ? "" : " + SPEF " + spef_path + " (" + std::to_string(spef_data.net_count) + " nets)") << "\n";
         printTimingResult(std::cout, result);
         std::cout << std::fixed << std::setprecision(2) << "Load:    liberty " << ms(t0, t1) << " ms, netlist " << ms(t1, t2)
-                  << " ms, sdc " << ms(t2, t3) << " ms\n";
+                  << " ms, sdc " << ms(t2, t3) << " ms"
+                  << (spef_path.empty() ? "" : ", spef " + std::to_string(static_cast<int>(spef_data.ms_read)) + " ms") << "\n";
         if (!endpoints_path.empty()) {
             std::ofstream out(endpoints_path);
             writeEndpointSlacks(out, result);

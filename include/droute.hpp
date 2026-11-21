@@ -27,6 +27,7 @@ struct DrouteOptions {
     double top_via_factor = 1.0;    // extra cost of the via up to the top routing layer
     double other_layer = 1.0;       // inside a guide but not on the layer global routing chose (higher values added vias on mul16)
     double astar_weight = 1.2;      // A* estimate weight: 1.2 halves the search for 0.2% more wire (mac32)
+    int threads = 1;                // worker threads for spatial-wave parallel routing (portable std::thread)
 };
 
 struct DrouteSegment {

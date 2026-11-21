@@ -6,6 +6,7 @@
 #include "../include/groute.hpp"
 #include "../include/lef.hpp"
 #include "../include/place.hpp"
+#include "../include/spef.hpp"
 #include <chrono>
 #include <cstdlib>
 #include <fstream>
@@ -37,6 +38,8 @@ int usage() {
               << "  -no-detailed     skip detailed placement\n"
               << "  -no-route        no global routing\n"
               << "  -droute          detailed routing too (wires and vias go into the DEF)\n"
+              << "  -spef FILE       extract post-route RC parasitics as IEEE 1481 SPEF (requires -droute)\n"
+              << "  -j N             worker threads for detailed routing (default 1; portable std::thread)\n"
               << "  -guide FILE      write the global route guides (OpenROAD format)\n"
               << "  -adjust A        fraction of tracks held back for detailed routing (default 0.3)\n"
               << "  -gcell N         gcell size in tracks (default 15)\n"
@@ -64,9 +67,10 @@ double ms(std::chrono::steady_clock::time_point a, std::chrono::steady_clock::ti
 
 int main(int argc, char* argv[]) {
     std::vector<std::string> lefs;
-    std::string netlist_path, out_path;
+    std::string netlist_path, out_path, spef_path;
     FloorplanOptions opt;
     bool quiet = false, place = true, route = true, droute = false;
+    int threads = 1;
     PlaceOptions popt;
     GrouteOptions gopt;
     std::string guide_path;
@@ -92,6 +96,8 @@ int main(int argc, char* argv[]) {
             else if (a == "-no-detailed") popt.detailed = false;
             else if (a == "-no-route") route = false;
             else if (a == "-droute") droute = true;
+            else if (a == "-spef" && v) spef_path = argv[++i];
+            else if (a == "-j" && v) threads = std::max(1, std::stoi(argv[++i]));
             else if (a == "-guide" && v) guide_path = argv[++i];
             else if (a == "-adjust" && v) gopt.adjustment = std::stod(argv[++i]);
             else if (a == "-gcell" && v) gopt.gcell_tracks = std::stoi(argv[++i]);
@@ -104,6 +110,10 @@ int main(int argc, char* argv[]) {
             else netlist_path = a;
         }
         if (netlist_path.empty()) return usage();
+        if (!spef_path.empty() && (!place || !route || !droute)) {
+            std::cerr << "fastpnr: -spef requires -droute with placement and routing enabled\n";
+            return 2;
+        }
 
         auto t0 = std::chrono::steady_clock::now();
         std::string base = pdkBase();
@@ -167,12 +177,14 @@ int main(int argc, char* argv[]) {
         bool detailed = routed && droute;
         if (detailed) {
             DrouteOptions dopt;
+            dopt.threads = threads;
             if (const char* w = std::getenv("FASTPNR_ASTAR_WEIGHT")) dopt.astar_weight = std::atof(w);
             if (const char* v = std::getenv("FASTPNR_VIA_COST")) dopt.via_cost = std::atof(v);
             if (const char* v = std::getenv("FASTPNR_OTHER_LAYER")) dopt.other_layer = std::atof(v);
             if (const char* v = std::getenv("FASTPNR_ACCESS_PENALTY")) dopt.access_penalty = std::atof(v);
             if (const char* v = std::getenv("FASTPNR_TOP_VIA")) dopt.top_via_factor = std::atof(v);
             if (const char* v = std::getenv("FASTPNR_WRONG_WAY")) dopt.wrong_way = std::atof(v);
+            if (const char* v = std::getenv("FASTPNR_THREADS")) dopt.threads = std::max(1, std::atoi(v));
             dr = detailedRoute(fp, netlist, lef, gr, dopt);
             if (dr.conflicts) problems.push_back(std::to_string(dr.conflicts) + " detailed-routing conflicts left (shorts or spacing)");
             if (dr.unrouted) problems.push_back(std::to_string(dr.unrouted) + " nets not fully connected");
@@ -183,6 +195,11 @@ int main(int argc, char* argv[]) {
             std::ofstream out(out_path);
             if (!out) throw std::runtime_error("cannot write " + out_path);
             writeDef(out, fp, netlist, lef, detailed ? &dr : nullptr);
+        }
+        if (!spef_path.empty() && detailed) {
+            std::ofstream sout(spef_path);
+            if (!sout) throw std::runtime_error("cannot write " + spef_path);
+            writeSpef(sout, fp, netlist, lef, dr);
         }
         auto t4 = std::chrono::steady_clock::now();
 

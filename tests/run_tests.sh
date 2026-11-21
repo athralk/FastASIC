@@ -72,6 +72,8 @@ for a in "$DIR"/equiv/fail/*.a.v; do
     check "different   $(basename "${a%.a.v}")" 1 "FAIL" "$BIN" --equiv "$a" "${a%.a.v}.b.v"
 done
 
+check "explicit equivalence cannot skip the proof" 2 "--equiv requires sat or sim" "$BIN" --equiv-method none --equiv "$DIR/equiv/fail/and_vs_or.a.v" "$DIR/equiv/fail/and_vs_or.b.v"
+
 echo "Equivalence checker (simulation):"
 for a in "$DIR"/equiv/pass/*.a.v; do
     check "equivalent  $(basename "${a%.a.v}")" 0 "PASS" "$BIN" --equiv-method sim --equiv "$a" "${a%.a.v}.b.v"
@@ -111,6 +113,15 @@ else
     echo "  skipped (build it with: make tests/sta_bruteforce)"
 fi
 
+echo "SPEF extraction and loaded RC delay (analytic reference circuits):"
+if [ -x "$DIR/spef_regression" ]; then
+    spef_tmp=$(mktemp)
+    check "junctions, vias, physical patches, opens, SDC loads and Liberty corner loads" 0 "checks passed" "$DIR/spef_regression" "$spef_tmp"
+    rm -f "$spef_tmp"
+else
+    echo "  skipped (build it with: make tests/spef_regression)"
+fi
+
 echo "Formal cross-check against Yosys (SAT proof that our netlist matches Yosys's reading of the RTL):"
 if command -v yosys > /dev/null; then
     for f in "$DIR/../example.v" "$DIR"/cases/*.v "$DIR"/seq/*.v "$DIR"/hier/*.v "$DIR"/lang/*.v; do
@@ -133,7 +144,7 @@ if [ -f "$PDK_LIB" ] && [ -x "$LSTA" ]; then
     done < <(bash "$DIR/lsta_golden.sh" "$LSTA")
     tmpnet=$(mktemp)
     "$LSTA" -q -sdc "$DIR/../bench/sta/propagated.sdc" -cts sg13cmos5l_buf_8 -cts_fanout 6 -write "$tmpnet" "$DIR/../bench/sta/netlists/mul16.v" > /dev/null
-    check "netlist write + re-read keeps every slack" 0 "setup         -547.25" "$LSTA" -q -sdc "$DIR/../bench/sta/propagated.sdc" "$tmpnet"
+    check "netlist write + re-read keeps every slack" 0 "setup         -539.10" "$LSTA" -q -sdc "$DIR/../bench/sta/propagated.sdc" "$tmpnet"
     rm -f "$tmpnet"
 else
     echo "  skipped (IHP sg13cmos5l PDK not found at \$PDK_ROOT or ~/ttsetup/pdk)"
@@ -196,6 +207,15 @@ echo "Physical design (fastpnr: floorplan, placement, global routing; every resu
 echo "OpenROAD also checks the floorplans with FASTASIC_OPENROAD=1, IHP's DRC and LVS decks the routes with FASTASIC_SIGNOFF=1):"
 if [ -f "$PDK_LIB" ] && [ -x "$PNR" ]; then
     FP_TMP=$(mktemp -d)
+    check "both clock domains get balanced trees" 0 "Clock tree buffers: 4, high-fanout nets buffered: 0" \
+        "$BIN" -q --map delay -o "$FP_TMP/domains.v" "$DIR/seq/clock_domains.v"
+    check "buffer names survive a structural Verilog round trip" 0 "80 registers" "$LSTA" -q "$FP_TMP/domains.v"
+    check "SPEF requires detailed routing" 2 "-spef requires -droute" \
+        "$PNR" -spef "$FP_TMP/invalid.spef" "$DIR/../bench/sta/netlists/acc16.v"
+    pdk_lef_dir=$(dirname "$(dirname "$PDK_LIB")")/lef
+    check "an inaccessible two-pin net is an open" 1 "1 nets not fully connected" \
+        "$PNR" -droute -lef "$pdk_lef_dir/sg13cmos5l_tech.lef" -lef "$pdk_lef_dir/sg13cmos5l_stdcell.lef" \
+        -lef "$DIR/pnr/inaccessible.lef" "$DIR/pnr/inaccessible.v"
     # a 52k-cell design: 8 copies of mac32 (generated, too large to keep in the repo)
     python3 "$DIR/../tools/replicate_netlist.py" "$DIR/../bench/sta/netlists/mac32.v" 8 > "$FP_TMP/mac32_x8.v"
     for f in "$DIR"/../bench/sta/netlists/*.v "$FP_TMP/mac32_x8.v"; do
@@ -216,6 +236,8 @@ if [ -f "$PDK_LIB" ] && [ -x "$PNR" ]; then
         check "$d.v: detailed routing, every pin reached (SRAM escapes too), no conflicts or opens" 0 "0 conflicts, 0 unconnected nets, 0 pins without access" \
             "$PNR" -droute -o "$FP_TMP/$d.routed.def" "$DIR/../bench/sta/netlists/$d.v"
     done
+    check "mul16.v: multithreaded -j 4 detailed routing + SPEF export + lsta -spef" 0 "Fmax" \
+        bash -c "'$PNR' -q -droute -j 4 -o '$FP_TMP/mul16_mt.def' -spef '$FP_TMP/mul16_mt.spef' '$DIR/../bench/sta/netlists/mul16.v' && '$LSTA' -q -corner slow -sdc '$DIR/../bench/sta/default.sdc' -spef '$FP_TMP/mul16_mt.spef' '$DIR/../bench/sta/netlists/mul16.v'"
     if [ "${FASTASIC_SIGNOFF:-0}" = 1 ]; then
         for d in acc16 sram_buffer fifo_2p; do
             check "$d: IHP KLayout DRC deck, 0 violations" 0 "DRC violations (excluding metal density): 0" bash "$DIR/../tools/drc_klayout.sh" "$FP_TMP/$d.routed.def"
@@ -255,7 +277,7 @@ if command -v iverilog > /dev/null && command -v yosys > /dev/null; then
             check "$(basename "$f") --adder $style" 0 "PASS" bash "$DIR/cosim.sh" "$BIN" "$f" 20000 --adder "$style"
         done
     done
-    export COSIM_MUTATE='0,/~\(/s//(/'
+    export COSIM_MUTATE='1,/~\(/s/~\(/(/'
     check "co-simulation catches a planted bug (an inversion removed)" 1 "FAIL" bash "$DIR/cosim.sh" "$BIN" "$DIR/lang/multipliers.v" 20000
     unset COSIM_MUTATE
 else

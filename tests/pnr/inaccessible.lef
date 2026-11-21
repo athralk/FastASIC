@@ -1,0 +1,22 @@
+MACRO inaccessible
+  CLASS CORE ;
+  SIZE 1.92 BY 3.78 ;
+  SITE CoreSite ;
+  PIN A
+    DIRECTION INPUT ;
+    USE SIGNAL ;
+    PORT
+      LAYER Metal1 ;
+      RECT 0.10 0.10 0.11 0.11 ;
+    END
+  END A
+  PIN X
+    DIRECTION OUTPUT ;
+    USE SIGNAL ;
+    PORT
+      LAYER Metal1 ;
+      RECT 1.30 2.02 1.60 3.18 ;
+    END
+  END X
+END inaccessible
+END LIBRARY

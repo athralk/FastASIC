@@ -546,7 +546,7 @@ PlaceResult placeDesign(Floorplan& fp, const CellNetlist& nl, const Lef& lef, co
         res.iterations = it;
         double gap = upper > 0 ? (upper - lower) / upper : 0;
         if (gap < best_gap - 0.002) { best_gap = gap; stalled = 0; }
-        else if (++stalled >= 4) break;
+        else if (gap < 0.5 && ++stalled >= 5) break;
         if (std::getenv("FASTPNR_TRACE")) fprintf(stderr, "gp %d lower %.0f upper %.0f gap %.3f\n", it, lower / lef.dbu, upper / lef.dbu, gap);
         if (gap < opt.stop_gap) break;
         // Anchors towards the spread positions, stronger each iteration

@@ -59,6 +59,26 @@ void writeVerilog(std::ostream& out, const Design& design) {
         out << ";\n";
     }
 
+    // Declare macro outputs before gate expressions and bit selects reference them.
+    for (const auto& m : design.macros) {
+        std::map<std::string, std::pair<int, int>> out_buses;
+        for (const auto& [pin, q] : m.outputs) {
+            size_t b = q.rfind('[');   // declare the nets the outputs drive, by their own names
+            if (b == std::string::npos || q.back() != ']') {
+                out << "    wire " << verilogRef(q) << ";\n";
+            } else {
+                int bit = std::stoi(q.substr(b + 1));
+                std::string base = q.substr(0, b);
+                auto& range = out_buses.emplace(base, std::make_pair(bit, bit)).first->second;
+                range.first = std::max(range.first, bit);
+                range.second = std::min(range.second, bit);
+            }
+        }
+        for (const auto& [base, range] : out_buses) {
+            out << "    wire [" << range.first << ":" << range.second << "] " << verilogRef(base) << ";\n";
+        }
+    }
+
     // Ports, registers and constants keep their own names; every gate becomes a wire named after its id
     std::unordered_map<const GateNode*, std::string> names;
     for (const auto& node : topologicalOrder(design.forest)) {
@@ -135,24 +155,8 @@ void writeVerilog(std::ostream& out, const Design& design) {
                 bus.bits[std::stoi(pin.substr(b + 1))] = net;
             }
         };
-        std::map<std::string, std::pair<int, int>> out_buses;
         for (const auto& [pin, root] : m.inputs) add(pin, macro_in.at(root));
-        for (const auto& [pin, q] : m.outputs) {
-            add(pin, verilogRef(q));
-            size_t b = q.rfind('[');   // declare the nets the outputs drive, by their own names
-            if (b == std::string::npos || q.back() != ']') {
-                out << "    wire " << verilogRef(q) << ";\n";
-            } else {
-                int bit = std::stoi(q.substr(b + 1));
-                std::string base = q.substr(0, b);
-                auto& range = out_buses.emplace(base, std::make_pair(bit, bit)).first->second;
-                range.first = std::max(range.first, bit);
-                range.second = std::min(range.second, bit);
-            }
-        }
-        for (const auto& [base, range] : out_buses) {
-            out << "    wire [" << range.first << ":" << range.second << "] " << verilogRef(base) << ";\n";
-        }
+        for (const auto& [pin, q] : m.outputs) add(pin, verilogRef(q));
         out << "    " << m.cell << " " << verilogRef(m.name) << " (";
         for (size_t k = 0; k < order.size(); ++k) {
             const Bus& bus = pins.at(order[k]);
