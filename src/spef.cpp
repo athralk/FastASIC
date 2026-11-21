@@ -4,7 +4,10 @@
 #include <cmath>
 #include <fstream>
 #include <iomanip>
+#include <limits>
 #include <queue>
+#include <set>
+#include <tuple>
 #include <sstream>
 #include <stdexcept>
 #include <vector>
@@ -47,8 +50,9 @@ struct RcEdge {
 // Units: R in ohm, C in fF => R * C * 1e-3 = ps (since 1 ohm * 1 fF = 1e-15 s = 0.001 ps).
 std::vector<double> computeElmoreTreePs(int n_nodes, int root, const std::vector<double>& node_cap_ff,
                                         const std::vector<std::vector<RcEdge>>& adj) {
-    std::vector<double> elmore(n_nodes, 0.0);
+    std::vector<double> elmore(n_nodes, std::numeric_limits<double>::infinity());
     if (root < 0 || root >= n_nodes) return elmore;
+    elmore[root] = 0.0;
     std::vector<int> parent(n_nodes, -1);
     std::vector<double> parent_r(n_nodes, 0.0);
     std::vector<int> order;
@@ -89,9 +93,32 @@ struct PinLoc {
     bool is_port = false;
     bool is_driver = false;
     Dbu x = 0, y = 0;
+    std::vector<LefShape> shapes;
 };
 
 } // namespace
+
+std::unordered_map<std::string, double> NetParasitics::elmoreDelays(
+    const std::unordered_map<std::string, double>& pin_cap_ff) const {
+    std::vector<double> cap = node_cap_ff;
+    for (const auto& [pin, c] : pin_cap_ff) {
+        auto it = load_nodes.find(pin);
+        if (it != load_nodes.end()) cap[it->second] += c;
+    }
+    std::vector<std::vector<RcEdge>> adj(cap.size());
+    for (const auto& r : resistors) {
+        adj[r.from].push_back({r.to, r.ohm});
+        adj[r.to].push_back({r.from, r.ohm});
+    }
+    std::unordered_map<std::string, double> delays;
+    if (driver_node < 0) return delays;
+    auto elmore = computeElmoreTreePs(static_cast<int>(cap.size()), driver_node, cap, adj);
+    for (const auto& [pin, n] : load_nodes) {
+        if (!std::isfinite(elmore[n])) throw std::runtime_error("SPEF: load pin '" + pin + "' is disconnected from its driver");
+        delays[pin] = elmore[n];
+    }
+    return delays;
+}
 
 void writeSpef(std::ostream& out, const Floorplan& fp, const CellNetlist& nl, const Lef& lef,
                const DrouteResult& dr, double cap_scale) {
@@ -102,7 +129,9 @@ void writeSpef(std::ostream& out, const Floorplan& fp, const CellNetlist& nl, co
         if (pb.net < 2 || static_cast<size_t>(pb.net) >= nl.netCount()) continue;
         Dbu cx = p.x + (p.shape.x0 + p.shape.x1) / 2;
         Dbu cy = p.y + (p.shape.y0 + p.shape.y1) / 2;
-        net_pins[pb.net].push_back({spefEscape(pb.name), pb.name, true, pb.is_input, cx, cy});
+        Rect r = p.shape;
+        r.x0 += p.x; r.x1 += p.x; r.y0 += p.y; r.y1 += p.y;
+        net_pins[pb.net].push_back({spefEscape(pb.name), pb.name, true, pb.is_input, cx, cy, {{p.layer, r}}});
     }
     for (const FpComponent& c : fp.components) {
         if (!c.placed) continue;
@@ -112,8 +141,9 @@ void writeSpef(std::ostream& out, const Floorplan& fp, const CellNetlist& nl, co
             if (net < 2 || static_cast<size_t>(net) >= nl.netCount()) continue;
             int lp = c.macro->pinIndex(inst.cell->pins[k].name);
             Dbu cx = c.x + c.macro->width / 2, cy = c.y + c.macro->height / 2;
-            if (lp >= 0 && !c.macro->pins[lp].shapes.empty()) {
-                Rect r = c.macro->pins[lp].shapes[0].rect;
+            std::vector<LefShape> shapes;
+            if (lp >= 0) for (const auto& shape : c.macro->pins[lp].shapes) {
+                Rect r = shape.rect;
                 if (c.orient == Orient::FS || c.orient == Orient::S) {
                     Dbu a = c.macro->height - r.y1, b = c.macro->height - r.y0;
                     r.y0 = a; r.y1 = b;
@@ -122,12 +152,13 @@ void writeSpef(std::ostream& out, const Floorplan& fp, const CellNetlist& nl, co
                     Dbu a = c.macro->width - r.x1, b = c.macro->width - r.x0;
                     r.x0 = a; r.x1 = b;
                 }
-                cx = c.x + (r.x0 + r.x1) / 2;
-                cy = c.y + (r.y0 + r.y1) / 2;
+                r.x0 += c.x; r.x1 += c.x; r.y0 += c.y; r.y1 += c.y;
+                if (shapes.empty()) { cx = (r.x0 + r.x1) / 2; cy = (r.y0 + r.y1) / 2; }
+                shapes.push_back({shape.layer, r});
             }
             bool drv = inst.cell->pins[k].dir == PinDir::OUTPUT;
             net_pins[net].push_back({spefPinName(inst.name, inst.cell->pins[k].name),
-                                     inst.name + "/" + inst.cell->pins[k].name, false, drv, cx, cy});
+                                     inst.name + "/" + inst.cell->pins[k].name, false, drv, cx, cy, std::move(shapes)});
         }
     }
 
@@ -218,95 +249,147 @@ void writeSpef(std::ostream& out, const Floorplan& fp, const CellNetlist& nl, co
         std::vector<SegRes> resistors;
         double total_cap_pf = 0.0;
 
-        for (const DrouteSegment& s : dn.wires) {
-            if (s.layer < 0 || static_cast<size_t>(s.layer) >= lef.layers.size()) continue;
+        auto validLayer = [&](int l) { return l >= 0 && static_cast<size_t>(l) < lef.layers.size(); };
+        auto inside = [](Dbu x, Dbu y, const Rect& r) {
+            return x >= r.x0 && x <= r.x1 && y >= r.y0 && y <= r.y1;
+        };
+        auto onSegment = [](Dbu x, Dbu y, const DrouteSegment& s) {
+            return x >= std::min(s.x0, s.x1) && x <= std::max(s.x0, s.x1) &&
+                   y >= std::min(s.y0, s.y1) && y <= std::max(s.y0, s.y1) &&
+                   (s.x0 == s.x1 ? x == s.x0 : y == s.y0);
+        };
+
+        // Register every physical junction before extracting any wire. Merged router
+        // runs must be split at branches and vias, not joined later by guessed resistors.
+        for (const auto& s : dn.wires) {
+            if (!validLayer(s.layer)) continue;
+            getNode(s.layer, s.x0, s.y0);
+            getNode(s.layer, s.x1, s.y1);
+        }
+        for (const auto& v : dn.vias) {
+            if (!validLayer(v.bottom)) continue;
+            int top = v.bottom + 1;
+            while (validLayer(top) && lef.layers[top].type != LayerType::ROUTING) ++top;
+            if (!validLayer(top)) continue;
+            int a = getNode(v.bottom, v.x, v.y), b = getNode(top, v.x, v.y);
+            resistors.push_back({a, b, via_res[v.bottom]});
+        }
+        for (size_t i = 0; i < dn.wires.size(); ++i) {
+            const auto& a = dn.wires[i];
+            if (!validLayer(a.layer)) continue;
+            for (size_t j = i + 1; j < dn.wires.size(); ++j) {
+                const auto& b = dn.wires[j];
+                if (a.layer != b.layer || (a.x0 == a.x1) == (b.x0 == b.x1)) continue;
+                Dbu x = a.x0 == a.x1 ? a.x0 : b.x0;
+                Dbu y = a.x0 == a.x1 ? b.y0 : a.y0;
+                if (onSegment(x, y, a) && onSegment(x, y, b)) getNode(a.layer, x, y);
+            }
+        }
+        // A pin or patch can meet the middle of a run without a via at that point.
+        auto addShapeContacts = [&](int layer, const Rect& r) {
+            if (!validLayer(layer)) return;
+            for (const auto& s : dn.wires) {
+                if (s.layer != layer) continue;
+                Dbu x = std::clamp((r.x0 + r.x1) / 2, std::min(s.x0, s.x1), std::max(s.x0, s.x1));
+                Dbu y = std::clamp((r.y0 + r.y1) / 2, std::min(s.y0, s.y1), std::max(s.y0, s.y1));
+                if (inside(x, y, r)) getNode(layer, x, y);
+            }
+        };
+        for (const auto& p : pins) for (const auto& shape : p.shapes) addShapeContacts(shape.layer, shape.rect);
+        for (const auto& [layer, rect] : dn.patches) addShapeContacts(layer, rect);
+
+        std::vector<std::vector<int>> layer_nodes(lef.layers.size());
+        for (size_t k = 0; k < nodes.size(); ++k) layer_nodes[nodes[k].l].push_back(static_cast<int>(k));
+        // Overlapping collinear runs share each subsegment and must not double-count RC.
+        std::set<std::pair<int, int>> wire_edges;
+        for (const auto& s : dn.wires) {
+            if (!validLayer(s.layer)) continue;
+            std::vector<int> cuts;
+            for (int k : layer_nodes[s.layer]) if (onSegment(nodes[k].x, nodes[k].y, s)) cuts.push_back(k);
+            std::sort(cuts.begin(), cuts.end(), [&](int a, int b) {
+                return std::tie(nodes[a].x, nodes[a].y) < std::tie(nodes[b].x, nodes[b].y);
+            });
             const LefLayer& L = lef.layers[s.layer];
-            double len_um = lef.toMicrons(std::llabs(s.x1 - s.x0) + std::llabs(s.y1 - s.y0));
-            if (len_um <= 0.0) continue;
             double w_um = std::max(drawn_w_um[s.layer], 0.16);
             double r_sq = L.res_per_sq > 0 ? L.res_per_sq : 0.11;
             double c_area = L.cap_per_area > 0 ? L.cap_per_area : 1.8e-5;
             double c_edge = L.edge_cap > 0 ? L.edge_cap : 4.5e-5;
-            double r = std::max(0.01, r_sq * (len_um / w_um));
-            double c_pf = cap_scale * (c_area * len_um * w_um + 2.0 * c_edge * len_um);
-            int a = getNode(s.layer, s.x0, s.y0);
-            int b = getNode(s.layer, s.x1, s.y1);
-            nodes[a].cap_pf += 0.5 * c_pf;
-            nodes[b].cap_pf += 0.5 * c_pf;
-            total_cap_pf += c_pf;
-            if (a != b) resistors.push_back({a, b, r});
+            for (size_t k = 1; k < cuts.size(); ++k) {
+                int a = cuts[k - 1], b = cuts[k];
+                if (!wire_edges.emplace(std::min(a, b), std::max(a, b)).second) continue;
+                double len_um = lef.toMicrons(std::llabs(nodes[a].x - nodes[b].x) + std::llabs(nodes[a].y - nodes[b].y));
+                if (len_um <= 0) continue;
+                double r = r_sq * len_um / w_um;
+                double c_pf = cap_scale * (c_area * len_um * w_um + 2.0 * c_edge * len_um);
+                nodes[a].cap_pf += 0.5 * c_pf;
+                nodes[b].cap_pf += 0.5 * c_pf;
+                total_cap_pf += c_pf;
+                resistors.push_back({a, b, r});
+            }
         }
 
-        // Add patch capacitance (small Metal2/Metal3 bridge rectangles)
+        std::vector<int> uf(nodes.size());
+        for (size_t i = 0; i < uf.size(); ++i) uf[i] = static_cast<int>(i);
+        auto findU = [&](int x) {
+            while (uf[x] != x) { uf[x] = uf[uf[x]]; x = uf[x]; }
+            return x;
+        };
+        for (const auto& r : resistors) uf[findU(r.a)] = findU(r.b);
+        auto shapeNodes = [&](int layer, const Rect& r) {
+            std::vector<int> contacts;
+            if (validLayer(layer)) for (int k : layer_nodes[layer]) {
+                if (inside(nodes[k].x, nodes[k].y, r)) contacts.push_back(k);
+            }
+            return contacts;
+        };
+        // Bridge only contacts on the actual metal rectangle, on its own layer.
+        // Patch resistance is a sheet-resistance estimate; it never repairs an open.
         for (const auto& [layer, rect] : dn.patches) {
-            if (layer < 0 || static_cast<size_t>(layer) >= lef.layers.size()) continue;
+            if (!validLayer(layer)) continue;
+            auto contacts = shapeNodes(layer, rect);
+            if (contacts.empty()) throw std::runtime_error("SPEF: isolated patch on net " + nl.net_names[net]);
             const LefLayer& L = lef.layers[layer];
-            double w_um = lef.toMicrons(rect.width());
-            double h_um = lef.toMicrons(rect.height());
+            double w_um = lef.toMicrons(rect.width()), h_um = lef.toMicrons(rect.height());
             double c_area = L.cap_per_area > 0 ? L.cap_per_area : 1.8e-5;
             double c_edge = L.edge_cap > 0 ? L.edge_cap : 4.5e-5;
             double c_pf = cap_scale * (c_area * w_um * h_um + c_edge * 2.0 * (w_um + h_um));
-            if (!nodes.empty()) {
-                nodes[0].cap_pf += c_pf;
-                total_cap_pf += c_pf;
+            total_cap_pf += c_pf;
+            int a = contacts.front();
+            for (int b : contacts) {
+                nodes[b].cap_pf += c_pf / contacts.size();
+                if (findU(a) == findU(b)) continue;
+                double squares = lef.toMicrons(std::llabs(nodes[a].x - nodes[b].x)) / std::max(h_um, 0.001)
+                               + lef.toMicrons(std::llabs(nodes[a].y - nodes[b].y)) / std::max(w_um, 0.001);
+                resistors.push_back({a, b, std::max(0.01, (L.res_per_sq > 0 ? L.res_per_sq : 0.11) * squares)});
+                uf[findU(b)] = findU(a);
             }
         }
 
-        // Vias connect lower routing layer to next routing layer above
-        for (const DrouteVia& v : dn.vias) {
-            int l_bot = v.bottom;
-            int l_top = -1;
-            for (int ll = l_bot + 1; ll < static_cast<int>(lef.layers.size()); ++ll) {
-                if (lef.layers[ll].type == LayerType::ROUTING) { l_top = ll; break; }
+        for (const auto& p : pins) {
+            std::vector<int> contacts;
+            for (const auto& shape : p.shapes) {
+                auto touched = shapeNodes(shape.layer, shape.rect);
+                contacts.insert(contacts.end(), touched.begin(), touched.end());
             }
-            if (l_bot < 0 || l_top < 0) continue;
-            int a = getNode(l_bot, v.x, v.y);
-            int b = getNode(l_top, v.x, v.y);
-            double r = via_res[l_bot];
-            resistors.push_back({a, b, r});
-        }
-
-        // Attach each logical pin to its nearest routed RC node (with tiny 1 ohm stub)
-        int base_rc_nodes = static_cast<int>(nodes.size());
-        for (const PinLoc& p : pins) {
+            if (contacts.empty()) throw std::runtime_error("SPEF: no routed access for pin " + p.lsta_name);
+            int best = contacts.front();
+            for (int k : contacts) {
+                Dbu d = std::llabs(nodes[k].x - p.x) + std::llabs(nodes[k].y - p.y);
+                Dbu bd = std::llabs(nodes[best].x - p.x) + std::llabs(nodes[best].y - p.y);
+                if (d < bd) best = k;
+            }
+            // Separate access points on the same logical pin are joined by its metal.
+            for (int k : contacts) if (findU(k) != findU(best)) {
+                resistors.push_back({best, k, 1.0});
+                uf[findU(k)] = findU(best);
+            }
             int p_id = static_cast<int>(nodes.size());
             nodes.push_back({-1, p.x, p.y, 0.0, p.spef_name});
-            int best = -1;
-            Dbu best_d = (1LL << 60);
-            for (int k = 0; k < base_rc_nodes; ++k) {
-                Dbu d = std::llabs(nodes[k].x - p.x) + std::llabs(nodes[k].y - p.y);
-                if (d < best_d) { best_d = d; best = k; }
-            }
-            if (best >= 0) {
-                resistors.push_back({p_id, best, 1.0});
-            }
+            resistors.push_back({p_id, best, 1.0});
         }
-
-        // If a net had segments broken into multiple disconnected components (e.g. via T-junctions
-        // mid-segment), connect components at nearest points so Elmore reaches every pin cleanly.
-        if (base_rc_nodes > 1) {
-            // Connect any wire endpoint lying strictly inside another same-layer segment
-            // (already mostly shared at grid intersections, so union-find catches any remaining splits)
-            std::vector<int> uf(nodes.size());
-            for (size_t i = 0; i < uf.size(); ++i) uf[i] = static_cast<int>(i);
-            auto findU = [&](int x) {
-                while (uf[x] != x) { uf[x] = uf[uf[x]]; x = uf[x]; }
-                return x;
-            };
-            for (const SegRes& r : resistors) uf[findU(r.a)] = findU(r.b);
-            int root0 = findU(0);
-            for (int i = 1; i < base_rc_nodes; ++i) {
-                if (findU(i) == root0) continue;
-                int best = 0;
-                Dbu best_d = (1LL << 60);
-                for (int j = 0; j < base_rc_nodes; ++j) {
-                    if (findU(j) != root0) continue;
-                    Dbu d = std::llabs(nodes[i].x - nodes[j].x) + std::llabs(nodes[i].y - nodes[j].y);
-                    if (d < best_d) { best_d = d; best = j; }
-                }
-                double dist_um = lef.toMicrons(best_d);
-                resistors.push_back({i, best, std::max(0.1, dist_um * 0.5)});
-                uf[findU(i)] = root0;
+        for (size_t k = 1; k < uf.size(); ++k) {
+            if (findU(static_cast<int>(k)) != findU(0)) {
+                throw std::runtime_error("SPEF: disconnected routed geometry on net " + nl.net_names[net]);
             }
         }
 
@@ -373,7 +456,7 @@ SpefData readSpef(const std::string& path) {
     double cur_total_cap_ff = 0.0;
     std::unordered_map<std::string, int> rc_node_id;
     std::vector<double> rc_cap_ff;
-    std::vector<std::vector<RcEdge>> rc_adj;
+    std::vector<SpefResistor> rc_resistors;
     int driver_node = -1;
     std::vector<std::pair<int, std::string>> load_pins; // (rc_node, lsta_pin_name)
     double total_res_ohm = 0.0;
@@ -384,7 +467,6 @@ SpefData readSpef(const std::string& path) {
         int id = static_cast<int>(rc_cap_ff.size());
         rc_node_id[name] = id;
         rc_cap_ff.push_back(0.0);
-        rc_adj.emplace_back();
         return id;
     };
 
@@ -395,19 +477,18 @@ SpefData readSpef(const std::string& path) {
         np.wire_res_ohm = total_res_ohm;
         // Fallback lumped Elmore delay: 0.5 * R_wire * C_wire * 1e-3 ps
         np.default_elmore_ps = 0.5 * total_res_ohm * cur_total_cap_ff * 1e-3;
-        if (driver_node >= 0 && !rc_cap_ff.empty()) {
-            std::vector<double> elmore = computeElmoreTreePs(static_cast<int>(rc_cap_ff.size()), driver_node, rc_cap_ff, rc_adj);
-            for (const auto& [nid, pname] : load_pins) {
-                np.pin_elmore_ps[pname] = elmore[nid];
-            }
-        }
+        np.driver_node = driver_node;
+        np.node_cap_ff = std::move(rc_cap_ff);
+        np.resistors = std::move(rc_resistors);
+        for (const auto& [nid, pname] : load_pins) np.load_nodes[pname] = nid;
+        np.pin_elmore_ps = np.elmoreDelays();
         data.nets[cur_net] = std::move(np);
         data.net_count++;
         cur_net.clear();
         cur_total_cap_ff = 0.0;
         rc_node_id.clear();
         rc_cap_ff.clear();
-        rc_adj.clear();
+        rc_resistors.clear();
         driver_node = -1;
         load_pins.clear();
         total_res_ohm = 0.0;
@@ -502,8 +583,7 @@ SpefData readSpef(const std::string& path) {
                 double r_ohm = std::max(0.0, val * r_to_ohm);
                 int u = getRcNode(resolve(n1));
                 int v = getRcNode(resolve(n2));
-                rc_adj[u].push_back({v, r_ohm});
-                rc_adj[v].push_back({u, r_ohm});
+                rc_resistors.push_back({u, v, r_ohm});
                 total_res_ohm += r_ohm;
             }
         }

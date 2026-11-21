@@ -11,6 +11,7 @@ LSTA = lsta
 PNR = fastpnr
 STA_CHECK = tests/sta_bruteforce
 SAT_CHECK = tests/sat_fuzz
+SPEF_CHECK = tests/spef_regression
 
 .PHONY: all test clean
 
@@ -35,8 +36,11 @@ $(STA_CHECK): $(STA_CHECK).cpp $(LIB_SRC) $(HDR)
 $(SAT_CHECK): $(SAT_CHECK).cpp src/cdcl_solver.cpp include/sat_solver.hpp
 	$(CXX) $(CXXFLAGS) $(SAT_CHECK).cpp src/cdcl_solver.cpp -o $(SAT_CHECK)
 
-test: $(TARGET) $(LSTA) $(PNR) $(STA_CHECK) $(SAT_CHECK)
+$(SPEF_CHECK): $(SPEF_CHECK).cpp $(LIB_SRC) $(HDR)
+	$(CXX) $(CXXFLAGS) $(SPEF_CHECK).cpp $(LIB_SRC) -o $(SPEF_CHECK)
+
+test: $(TARGET) $(LSTA) $(PNR) $(STA_CHECK) $(SAT_CHECK) $(SPEF_CHECK)
 	bash tests/run_tests.sh ./$(TARGET)
 
 clean:
-	rm -f $(TARGET) $(LSTA) $(PNR) $(STA_CHECK) $(SAT_CHECK)
+	rm -f $(TARGET) $(LSTA) $(PNR) $(STA_CHECK) $(SAT_CHECK) $(SPEF_CHECK)

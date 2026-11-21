@@ -111,6 +111,15 @@ else
     echo "  skipped (build it with: make tests/sta_bruteforce)"
 fi
 
+echo "SPEF extraction and loaded RC delay (analytic reference circuits):"
+if [ -x "$DIR/spef_regression" ]; then
+    spef_tmp=$(mktemp)
+    check "junctions, vias, physical patches, opens, SDC loads and Liberty corner loads" 0 "checks passed" "$DIR/spef_regression" "$spef_tmp"
+    rm -f "$spef_tmp"
+else
+    echo "  skipped (build it with: make tests/spef_regression)"
+fi
+
 echo "Formal cross-check against Yosys (SAT proof that our netlist matches Yosys's reading of the RTL):"
 if command -v yosys > /dev/null; then
     for f in "$DIR/../example.v" "$DIR"/cases/*.v "$DIR"/seq/*.v "$DIR"/hier/*.v "$DIR"/lang/*.v; do

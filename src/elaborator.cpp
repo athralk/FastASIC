@@ -1279,6 +1279,7 @@ class Elaborator {
     }
 
     struct MuxInfo {
+        NodePtr result;  // retain the node used as the key; allocator reuse must not alias old muxes
         NodePtr c, t, f;
     };
     std::unordered_map<const GateNode*, NodePtr> not_memo;
@@ -1307,8 +1308,13 @@ class Elaborator {
             if (mf.f == t) return muxBit(andGate(notGate(c), mf.c), mf.t, t);
             if (mf.t == t) return muxBit(andGate(notGate(c), notGate(mf.c)), mf.f, t);
         }
-        NodePtr n = orGate(andGate(c, t), andGate(notGate(c), f));
-        mux_memo[n.get()] = {c, t, f};
+        NodePtr when_true = andGate(c, t), when_false = andGate(notGate(c), f);
+        NodePtr n = orGate(when_true, when_false);
+        // Only a newly constructed OR is a mux root. Folding a ? a : 0 to a must
+        // not attach a self-referential mux description to that existing input.
+        if (n != when_true && n != when_false && n->type == GateType::OR) {
+            mux_memo.emplace(n.get(), MuxInfo{n, c, t, f});
+        }
         return n;
     }
 

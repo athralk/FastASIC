@@ -15,7 +15,7 @@
 //     recovery/removal for asynchronous resets) tables at (data slew, clock slew)
 //   - clocks are ideal (latency + transition from SDC) or propagated through the clock tree
 //   - primary inputs: input delay plus the delay of the SDC driving cell; outputs: output delay
-// Wires are ideal (no RC): the timing a netlist has right after synthesis.
+// Wires are ideal unless TimerOptions supplies SPEF wire RC for post-route timing.
 
 struct PathPoint {
     std::string pin;          // "inst/PIN" or a port name
