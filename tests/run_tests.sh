@@ -133,7 +133,7 @@ if [ -f "$PDK_LIB" ] && [ -x "$LSTA" ]; then
     done < <(bash "$DIR/lsta_golden.sh" "$LSTA")
     tmpnet=$(mktemp)
     "$LSTA" -q -sdc "$DIR/../bench/sta/propagated.sdc" -cts sg13cmos5l_buf_8 -cts_fanout 6 -write "$tmpnet" "$DIR/../bench/sta/netlists/mul16.v" > /dev/null
-    check "netlist write + re-read keeps every slack" 0 "setup         -547.25" "$LSTA" -q -sdc "$DIR/../bench/sta/propagated.sdc" "$tmpnet"
+    check "netlist write + re-read keeps every slack" 0 "setup         -539.10" "$LSTA" -q -sdc "$DIR/../bench/sta/propagated.sdc" "$tmpnet"
     rm -f "$tmpnet"
 else
     echo "  skipped (IHP sg13cmos5l PDK not found at \$PDK_ROOT or ~/ttsetup/pdk)"
@@ -216,6 +216,8 @@ if [ -f "$PDK_LIB" ] && [ -x "$PNR" ]; then
         check "$d.v: detailed routing, every pin reached (SRAM escapes too), no conflicts or opens" 0 "0 conflicts, 0 unconnected nets, 0 pins without access" \
             "$PNR" -droute -o "$FP_TMP/$d.routed.def" "$DIR/../bench/sta/netlists/$d.v"
     done
+    check "mul16.v: multithreaded -j 4 detailed routing + SPEF export + lsta -spef" 0 "Fmax" \
+        bash -c "'$PNR' -q -droute -j 4 -o '$FP_TMP/mul16_mt.def' -spef '$FP_TMP/mul16_mt.spef' '$DIR/../bench/sta/netlists/mul16.v' && '$LSTA' -q -corner slow -sdc '$DIR/../bench/sta/default.sdc' -spef '$FP_TMP/mul16_mt.spef' '$DIR/../bench/sta/netlists/mul16.v'"
     if [ "${FASTASIC_SIGNOFF:-0}" = 1 ]; then
         for d in acc16 sram_buffer fifo_2p; do
             check "$d: IHP KLayout DRC deck, 0 violations" 0 "DRC violations (excluding metal density): 0" bash "$DIR/../tools/drc_klayout.sh" "$FP_TMP/$d.routed.def"

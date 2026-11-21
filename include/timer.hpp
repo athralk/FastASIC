@@ -65,8 +65,11 @@ struct TimingResult {
     double ms_build = 0, ms_analyze = 0;
 };
 
+struct SpefData;
+
 struct TimerOptions {
-    int paths = 1;   // worst paths to trace per analysis
+    int paths = 1;                // worst paths to trace per analysis
+    const SpefData* spef = nullptr; // optional post-route RC parasitics (wire C + Elmore wire delay)
 };
 
 TimingResult analyzeNetlistTiming(const CellNetlist& netlist, const Library& lib, const Sdc& sdc,

@@ -16,6 +16,7 @@
 #include "../include/tech_mapper.hpp"
 #include "../include/cut_mapper.hpp"
 #include "../include/balance.hpp"
+#include "../include/clock_tree.hpp"
 #include "../include/timer.hpp"
 #include <algorithm>
 #include <cstdlib>
@@ -200,9 +201,14 @@ void printForest(const std::string& title, const std::string& rootLabel, const G
 enum class EquivMethod {
     SAT,    // SAT proof (default): a proof for any input count, and faster than simulation here
     SIM,    // simulation: exhaustive up to 20 inputs, 65,536 random patterns above (not a proof)
+    NONE,   // skip internal equivalence check (fast inner-loop exploration mode)
 };
 
 bool reportEquivalence(const std::string& label, const GateForest& a, const GateForest& b, EquivMethod method) {
+    if (method == EquivMethod::NONE) {
+        std::cout << "  " << label << ": SKIPPED (--equiv-method none)\n";
+        return true;
+    }
     std::cout << "  " << label << ": ";
     if (method == EquivMethod::SAT) {
         CecResult result = proveEquivalence(a, b);
@@ -318,6 +324,7 @@ int main(int argc, char* argv[]) {
     TimingConstraints constraints;
     std::string netlistPath, libPath, sdcPath;
     bool mapCells = false, nldm = false, treeMapper = false;
+    bool noBufferNets = false, forceBufferNets = false;
     MapGoal mapGoal = MapGoal::AREA;
     std::vector<std::string> files;
 
@@ -366,8 +373,11 @@ int main(int argc, char* argv[]) {
                 std::string name = argv[++i];
                 if (name == "sim") equivMethod = EquivMethod::SIM;
                 else if (name == "sat") equivMethod = EquivMethod::SAT;
+                else if (name == "none") equivMethod = EquivMethod::NONE;
                 else return usage(argv[0]);
             }
+            else if (arg == "--no-buffer") noBufferNets = true;
+            else if (arg == "--buffer-nets") forceBufferNets = true;
             else if (arg == "--delay-model" && hasValue) {
                 std::string name = argv[++i];
                 if (name == "rc") delayModel = DelayModel::RC;
@@ -452,6 +462,33 @@ int main(int argc, char* argv[]) {
             MapResult mapped = treeMapper ? mapToCells(design, optimizedForest, lib, mapGoal)
                                           : mapByCuts(design, optimizedForest, lib, mapGoal);
             cellNetlist = std::move(mapped.netlist);
+            if (!noBufferNets && (forceBufferNets || mapGoal == MapGoal::DELAY)) {
+                std::set<std::string> clk_ports = {"clk", "clock", "CLK"};
+                for (const auto& r : design.registers) {
+                    if (!r.clock.empty()) clk_ports.insert(r.clock);
+                }
+                int cts_bufs = 0;
+                if (!design.registers.empty() && !design.registers[0].clock.empty() && lib.find("sg13cmos5l_buf_8")) {
+                    ClockTreeOptions cto;
+                    cto.buffer = "sg13cmos5l_buf_8";
+                    cto.max_fanout = 24;
+                    try {
+                        ClockTreeReport ctr = insertClockTree(cellNetlist, lib, design.registers[0].clock, cto);
+                        cts_bufs = ctr.buffers;
+                        if (ctr.buffers > 0) mapped.cell_counts[cto.buffer] += ctr.buffers;
+                    } catch (const std::exception&) {}
+                }
+                BufferNetsReport bnr = bufferHighFanoutNets(cellNetlist, lib, 16, "sg13cmos5l_buf_4", clk_ports);
+                if (bnr.buffers_added > 0) mapped.cell_counts["sg13cmos5l_buf_4"] += bnr.buffers_added;
+                int hold_bufs = repairFastHoldPaths(cellNetlist, lib, 2, 24);
+                if (hold_bufs > 0) mapped.cell_counts["sg13cmos5l_dlygate4sd3_1"] += hold_bufs;
+                mapped.area = cellNetlist.area();
+                if (cts_bufs > 0 || bnr.buffers_added > 0 || hold_bufs > 0) {
+                    std::cout << "\n=== Net Buffering & Hold Repair ===\n"
+                              << "Clock tree buffers: " << cts_bufs << ", high-fanout nets buffered: " << bnr.buffered_nets
+                              << " (+" << bnr.buffers_added << " buf_4), hold buffers: " << hold_bufs << "\n";
+                }
+            }
             std::cout << "\n=== Technology Mapping (" << lib.name << ", " << (mapGoal == MapGoal::AREA ? "area" : "delay") << ") ===\n";
             int total = 0;
             std::string breakdown;

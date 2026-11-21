@@ -154,14 +154,26 @@ class Elaborator {
     NodePtr notGate(const NodePtr& a) {
         if (isConst(a, false)) return constant(true);
         if (isConst(a, true)) return constant(false);
-        return gate(GateType::NOT, a);
+        if (a->type == GateType::NOT && !a->inputs.empty()) return a->inputs[0];
+        auto it = not_memo.find(a.get());
+        if (it != not_memo.end()) return it->second;
+        NodePtr n = gate(GateType::NOT, a);
+        not_memo[a.get()] = n;
+        return n;
     }
 
     NodePtr andGate(const NodePtr& a, const NodePtr& b) {
         if (isConst(a, false) || isConst(b, false)) return constant(false);
         if (isConst(a, true)) return b;
         if (isConst(b, true)) return a;
-        return gate(GateType::AND, a, b);
+        if (a == b) return a;
+        const GateNode* p0 = std::min(a.get(), b.get());
+        const GateNode* p1 = std::max(a.get(), b.get());
+        auto it = and_memo.find({p0, p1});
+        if (it != and_memo.end()) return it->second;
+        NodePtr n = gate(GateType::AND, a, b);
+        and_memo[{p0, p1}] = n;
+        return n;
     }
 
     NodePtr orGate(const NodePtr& a, const NodePtr& b) {
@@ -1266,12 +1278,38 @@ class Elaborator {
         return Bits(sig.bits.size(), nullptr);
     }
 
+    struct MuxInfo {
+        NodePtr c, t, f;
+    };
+    std::unordered_map<const GateNode*, NodePtr> not_memo;
+    std::map<std::pair<const GateNode*, const GateNode*>, NodePtr> and_memo;
+    std::unordered_map<const GateNode*, MuxInfo> mux_memo;
+
     NodePtr muxBit(const NodePtr& c, const NodePtr& t, const NodePtr& f) {
         if (t == f) return t;
         if (!t || !f) return nullptr;   // assigned on only one path
         if (isConst(c, true)) return t;
         if (isConst(c, false)) return f;
-        return orGate(andGate(c, t), andGate(notGate(c), f));
+        // Collapse nested muxes that share a fallback branch (e.g. nested if-enable chains on registers/memories):
+        //   c ? (d ? x : f) : f  ==>  (c & d) ? x : f
+        //   c ? (d ? f : x) : f  ==>  (c & ~d) ? x : f
+        //   c ? t : (d ? x : t)  ==>  (~c & d) ? x : t
+        //   c ? t : (d ? t : x)  ==>  (~c & ~d) ? x : t
+        auto it_t = mux_memo.find(t.get());
+        if (it_t != mux_memo.end()) {
+            const MuxInfo mt = it_t->second;
+            if (mt.f == f) return muxBit(andGate(c, mt.c), mt.t, f);
+            if (mt.t == f) return muxBit(andGate(c, notGate(mt.c)), mt.f, f);
+        }
+        auto it_f = mux_memo.find(f.get());
+        if (it_f != mux_memo.end()) {
+            const MuxInfo mf = it_f->second;
+            if (mf.f == t) return muxBit(andGate(notGate(c), mf.c), mf.t, t);
+            if (mf.t == t) return muxBit(andGate(notGate(c), notGate(mf.c)), mf.f, t);
+        }
+        NodePtr n = orGate(andGate(c, t), andGate(notGate(c), f));
+        mux_memo[n.get()] = {c, t, f};
+        return n;
     }
 
     // env := c ? t : f, where t and f started as copies of env

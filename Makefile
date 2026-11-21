@@ -1,5 +1,6 @@
-CXX = g++
-CXXFLAGS = -std=c++17 -Iinclude -Wall -Wextra -O2
+CXX ?= g++
+OPTFLAGS ?= -O3
+CXXFLAGS = -std=c++17 -Iinclude -Wall -Wextra -pthread $(OPTFLAGS)
 
 SRC = $(wildcard src/*.cpp)
 HDR = $(wildcard include/*.hpp)

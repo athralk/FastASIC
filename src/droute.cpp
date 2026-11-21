@@ -1,15 +1,18 @@
 // Detailed router: track grid, pin access, negotiated A* routing inside the global-route guides
 #include "../include/droute.hpp"
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <functional>
 #include <map>
 #include <numeric>
 #include <queue>
 #include <stdexcept>
+#include <thread>
 #include <unordered_map>
 
 namespace {
@@ -105,11 +108,62 @@ struct Pin {
 struct RNet {
     int netlist_net;
     std::vector<Pin> pins;
+    std::vector<int> pin_order;  // Prim pin ordering, precomputed once at setup
     int gx0, gy0, gx1, gy1;      // bounding box in nodes
     std::vector<Node> used;      // nodes the routing occupies
     std::vector<Node> partners;  // nodes reserved next to its off-grid vias (not metal)
     std::vector<std::pair<Node, Node>> edges;
     bool ok = true;
+    bool has_escape = false;
+};
+
+struct AstarItem {
+    float f, d;
+    Node n;
+};
+
+// Reusable 4-ary min-heap: better cache locality than binary std::priority_queue and zero per-search allocations
+struct FastMinHeap {
+    std::vector<AstarItem> h;
+    void clear() { h.clear(); }
+    bool empty() const { return h.empty(); }
+    static bool less(const AstarItem& a, const AstarItem& b) {
+        return a.f < b.f || (a.f == b.f && a.d > b.d);
+    }
+    void push(const AstarItem& it) {
+        size_t i = h.size();
+        h.push_back(it);
+        while (i > 0) {
+            size_t p = (i - 1) >> 2;
+            if (!less(it, h[p])) break;
+            h[i] = h[p];
+            i = p;
+        }
+        h[i] = it;
+    }
+    AstarItem pop() {
+        AstarItem top = h[0];
+        AstarItem last = h.back();
+        h.pop_back();
+        const size_t sz = h.size();
+        if (sz > 0) {
+            size_t i = 0;
+            for (;;) {
+                size_t c = (i << 2) + 1;
+                if (c >= sz) break;
+                size_t best = c;
+                size_t end = std::min(sz, c + 4);
+                for (size_t k = c + 1; k < end; ++k) {
+                    if (less(h[k], h[best])) best = k;
+                }
+                if (!less(h[best], last)) break;
+                h[i] = h[best];
+                i = best;
+            }
+            h[i] = last;
+        }
+        return top;
+    }
 };
 
 } // namespace
@@ -684,6 +738,25 @@ DrouteResult detailedRoute(const Floorplan& fp, const CellNetlist& nl, const Lef
         for (const Pin& p : r.pins) for (Node t : p.terms) {
             r.gx0 = std::min(r.gx0, G.I(t)); r.gx1 = std::max(r.gx1, G.I(t));
             r.gy0 = std::min(r.gy0, G.J(t)); r.gy1 = std::max(r.gy1, G.J(t));
+            if (escape_of.count(t)) r.has_escape = true;
+        }
+        // Precompute Prim pin ordering once per net (pin positions never change across negotiation rounds)
+        r.pin_order.reserve(r.pins.size());
+        r.pin_order.push_back(0);
+        std::vector<char> taken(r.pins.size(), 0);
+        taken[0] = 1;
+        for (size_t k = 1; k < r.pins.size(); ++k) {
+            int best = -1;
+            double bd = 1e300;
+            for (size_t q = 0; q < r.pins.size(); ++q) {
+                if (taken[q]) continue;
+                for (int o : r.pin_order) {
+                    double d = std::fabs(r.pins[q].cx - r.pins[o].cx) + std::fabs(r.pins[q].cy - r.pins[o].cy);
+                    if (d < bd) { bd = d; best = static_cast<int>(q); }
+                }
+            }
+            taken[best] = 1;
+            r.pin_order.push_back(best);
         }
         nets.push_back(std::move(r));
     }
@@ -699,6 +772,20 @@ DrouteResult detailedRoute(const Floorplan& fp, const CellNetlist& nl, const Lef
             }
         }
     }
+    // Flat dense lookup tables replacing hash maps in inner routing & conflict loops
+    std::vector<Node> partner_node(N, kNone);
+    for (const auto& [k, v] : partner_of) partner_node[k] = v;
+    std::vector<int> escape_idx(N, -1);
+    std::vector<std::vector<Node>> escape_extras;
+    escape_extras.reserve(escape_of.size());
+    for (const auto& [k, e] : escape_of) {
+        escape_idx[k] = static_cast<int>(escape_extras.size());
+        escape_extras.push_back(e.extra);
+    }
+    std::vector<char> is_pad_node(N, 0);
+    for (const auto& [k, _] : offgrid) is_pad_node[k] = 1;
+    for (const auto& [k, _] : escape_of) is_pad_node[k] = 1;
+
     // Guides per netlist net, as gcell rectangles
     std::vector<int> guide_of(nl.netCount(), -1);
     for (size_t k = 0; k < gr.guides.size(); ++k) guide_of[gr.guides[k].first] = static_cast<int>(k);
@@ -708,22 +795,61 @@ DrouteResult detailedRoute(const Floorplan& fp, const CellNetlist& nl, const Lef
     auto t1 = std::chrono::steady_clock::now();
     std::vector<int> occ(N, 0), who(N, -1), pocc(N, 0), pwho(N, -1);
     std::vector<float> hist(N, 0);
-    std::vector<float> dist(N, 0);
-    std::vector<Node> parent(N, kNone);
-    std::vector<int> seen(N, -1), mark(N, -1), target(N, -1);
-    int search = 0, stamp = 0;
-    long stat_pops = 0, stat_searches = 0, stat_fallbacks = 0;
+    const int ggx = std::max(1, gr.gx), ggy = std::max(1, gr.gy);
+    const size_t plane = static_cast<size_t>(G.nx) * G.ny;
+    const uint32_t plane32 = static_cast<uint32_t>(plane);
+    const uint32_t nx32 = static_cast<uint32_t>(G.nx);
+
+    // Per-thread search workspace (compact uint16_t stamps keep memory low for multi-thread & 10-way parallel runs)
+    struct SearchCtx {
+        std::vector<float> dist;
+        std::vector<Node> parent;
+        std::vector<uint16_t> seen, mark, target;
+        std::vector<int> in_guide, in_layer_guide;
+        FastMinHeap pq;
+        std::vector<Node> path, tree;
+        uint16_t search = 0, mark_stamp = 0;
+        int guide_stamp = 0;
+        long stat_pops = 0, stat_searches = 0, stat_fallbacks = 0;
+
+        void init(size_t N, size_t gsize, size_t glsize) {
+            dist.assign(N, 0.0f);
+            parent.assign(N, kNone);
+            seen.assign(N, 0);
+            mark.assign(N, 0);
+            target.assign(N, 0);
+            in_guide.assign(gsize, -1);
+            in_layer_guide.assign(glsize, -1);
+            pq.h.reserve(4096);
+            path.reserve(512);
+            tree.reserve(512);
+        }
+        uint16_t nextSearch() {
+            if (++search == 65535) {
+                std::fill(seen.begin(), seen.end(), 0);
+                std::fill(target.begin(), target.end(), 0);
+                search = 1;
+            }
+            return search;
+        }
+        uint16_t nextMark() {
+            if (++mark_stamp == 65535) {
+                std::fill(mark.begin(), mark.end(), 0);
+                mark_stamp = 1;
+            }
+            return mark_stamp;
+        }
+    };
+
+    const int n_threads = std::max(1, opt.threads);
+    std::vector<SearchCtx> ctxs(static_cast<size_t>(n_threads));
+    for (auto& ctx : ctxs) ctx.init(N, static_cast<size_t>(ggx) * ggy, static_cast<size_t>(ggx) * ggy * G.nl);
+
     const bool trace_search = std::getenv("FASTPNR_TRACE_SEARCH") != nullptr;
     double pres = 1.0;
     const Dbu sx = G.xs[1] - G.xs[0], sy = G.ys[1] - G.ys[0];
     const double unit = static_cast<double>(std::min(sx, sy));
-    // gcell guide membership of the current net (plus a one-gcell ring)
-    const int ggx = std::max(1, gr.gx), ggy = std::max(1, gr.gy);
-    std::vector<int> in_guide(static_cast<size_t>(ggx) * ggy, -1);
-    // the layer each guide was assigned by global routing: staying on it is cheapest
-    std::vector<int> in_layer_guide(static_cast<size_t>(ggx) * ggy * G.nl, -1);
     // gcell of every (i, j), precomputed: the search asks for it on every step
-    const size_t plane = static_cast<size_t>(G.nx) * G.ny;
     std::vector<int> gcell2d(plane);
     for (int j = 0; j < G.ny; ++j) {
         int gy = std::clamp(static_cast<int>(G.ys[j] / std::max<Dbu>(gr.gcell, 1)), 0, ggy - 1);
@@ -750,7 +876,7 @@ DrouteResult detailedRoute(const Floorplan& fp, const CellNetlist& nl, const Lef
     std::vector<double> via_cost_up(G.nl, opt.via_cost * unit);
     if (G.nl >= 2) via_cost_up[G.nl - 2] = opt.via_cost * opt.top_via_factor * unit;
     // cost of entering node n = (i, j, l); the caller knows the coordinates (no divisions here)
-    auto nodeCostAt = [&](Node n, int i, int j, int l, int net, double base) {
+    auto nodeCostAt = [&](const SearchCtx& ctx, Node n, int i, int j, int l, int net, double base, bool all_guides) {
         double conflict = occ[n] > 0 && who[n] != net ? occ[n] : 0;
         if (pocc[n] > 0 && pwho[n] != net) conflict += pocc[n];
         if (l > 0) {
@@ -764,142 +890,125 @@ DrouteResult detailedRoute(const Floorplan& fp, const CellNetlist& nl, const Lef
         }
         // other nets' pin access points under a wire make them harder to reach
         if (l == 1) {
-            int o = pin_owner[n - static_cast<Node>(plane)];
+            int o = pin_owner[n - plane32];
             if (o >= 0 && o != net) conflict += opt.access_penalty;
         }
-        const size_t gc = gcell2d[static_cast<size_t>(j) * G.nx + i];
-        double g = in_layer_guide[gc * G.nl + l] == stamp ? 1.0 : in_guide[gc] == stamp ? opt.other_layer : opt.outside_guide;
+        double g = 1.0;
+        if (!all_guides) {
+            const size_t gc = gcell2d[static_cast<size_t>(j) * G.nx + i];
+            g = ctx.in_layer_guide[gc * G.nl + l] == ctx.guide_stamp ? 1.0
+              : ctx.in_guide[gc] == ctx.guide_stamp                  ? opt.other_layer
+                                                                     : opt.outside_guide;
+        }
         return base * g * (1.0 + hist[n]) * (1.0 + pres * conflict);
     };
-    auto occupy = [&](RNet& net, int id, Node n) {
-        if (mark[n] == stamp) return;
-        mark[n] = stamp;
+    auto occupy = [&](SearchCtx& ctx, RNet& net, int id, Node n) {
+        if (ctx.mark[n] == ctx.mark_stamp) return;
+        ctx.mark[n] = ctx.mark_stamp;
         net.used.push_back(n);
         occ[n]++;
         who[n] = id;
-        // a macro escape's Metal3 patch reaches more nodes: they were chosen as exactly the nodes
-        // whose metal would come too close to it, so no other net may use them (their own
-        // neighbours are free)
-        auto e = escape_of.find(n);
-        if (e != escape_of.end()) {
-            for (Node x : e->second.extra) {
+        int ei = escape_idx[n];
+        if (ei >= 0) {
+            for (Node x : escape_extras[ei]) {
                 net.partners.push_back(x);
                 pocc[x]++;
                 pwho[x] = id;
             }
         }
-        // an off-grid access also takes the node its via pad reaches towards: no other net may
-        // use that node, but it is not metal (its neighbours are free)
-        auto p = partner_of.find(n);
-        if (p != partner_of.end()) {
-            net.partners.push_back(p->second);
-            pocc[p->second]++;
-            pwho[p->second] = id;
+        Node pn = partner_node[n];
+        if (pn != kNone) {
+            net.partners.push_back(pn);
+            pocc[pn]++;
+            pwho[pn] = id;
         }
     };
     // A* from the tree (seen as sources) to any terminal of pin `p`
-    auto connect = [&](RNet& net, int id, const std::vector<Node>& tree, const Pin& p, int i0, int j0, int i1, int j1) {
-        search++;
+    auto connect = [&](SearchCtx& ctx, RNet& net, int id, const std::vector<Node>& tree, const Pin& p,
+                       int i0, int j0, int i1, int j1, bool all_guides) {
+        const uint16_t cur_search = ctx.nextSearch();
         int tx0 = 1 << 30, ty0 = 1 << 30, tx1 = -1, ty1 = -1;
         for (Node t : p.terms) {
-            target[t] = search;
+            ctx.target[t] = cur_search;
             tx0 = std::min(tx0, G.I(t)); tx1 = std::max(tx1, G.I(t));
             ty0 = std::min(ty0, G.J(t)); ty1 = std::max(ty1, G.J(t));
         }
-        // weighted estimate (opt.astar_weight >= 1): explores far fewer nodes for slightly
-        // longer paths; 1 gives exact cheapest paths
         auto hAt = [&](int i, int j) {
             double dx = i < tx0 ? G.xs[tx0] - G.xs[i] : i > tx1 ? G.xs[i] - G.xs[tx1] : 0;
             double dy = j < ty0 ? G.ys[ty0] - G.ys[j] : j > ty1 ? G.ys[j] - G.ys[ty1] : 0;
             return opt.astar_weight * (dx + dy);
         };
         auto h = [&](Node n) { return hAt(G.I(n), G.J(n)); };
-        // heap entries carry the distance they were pushed with: an entry is stale when a
-        // cheaper one has been pushed since
-        struct Item {
-            float f, d;
-            Node n;
-            bool operator>(const Item& o) const { return f > o.f || (f == o.f && d < o.d); }
-        };
-        std::priority_queue<Item, std::vector<Item>, std::greater<Item>> pq;
+        ctx.pq.clear();
         for (Node s : tree) {
-            seen[s] = search;
-            dist[s] = 0;
-            parent[s] = kNone;
-            pq.push({static_cast<float>(h(s)), 0.0f, s});
+            ctx.seen[s] = cur_search;
+            ctx.dist[s] = 0.0f;
+            ctx.parent[s] = kNone;
+            ctx.pq.push({static_cast<float>(h(s)), 0.0f, s});
         }
         Node found = kNone;
-        const Node layer_size = static_cast<Node>(static_cast<size_t>(G.nx) * G.ny);
-        while (!pq.empty()) {
-            Item top = pq.top();
-            pq.pop();
+        const Node layer_size = plane32;
+        while (!ctx.pq.empty()) {
+            AstarItem top = ctx.pq.pop();
             Node n = top.n;
-            stat_pops++;
-            if (top.d > dist[n]) continue;   // stale
-            if (target[n] == search) { found = n; break; }
-            const size_t r2 = n % plane;
-            const int l = static_cast<int>(n / plane), i = static_cast<int>(r2 % G.nx), j = static_cast<int>(r2 / G.nx);
+            ctx.stat_pops++;
+            if (top.d > ctx.dist[n]) continue;   // stale
+            if (ctx.target[n] == cur_search) { found = n; break; }
+            const uint32_t l = n / plane32;
+            const uint32_t r2 = n - l * plane32;
+            const uint32_t ju = r2 / nx32;
+            const int i = static_cast<int>(r2 - ju * nx32);
+            const int j = static_cast<int>(ju);
+            const int li = static_cast<int>(l);
             struct Nb { Node m; int i, j, l; double base; };
             Nb nb[6];
             int k = 0;
-            if (l > 0) {
-                if (G.hor[l]) {
-                    if (i > i0) nb[k++] = {n - 1, i - 1, j, l, static_cast<double>(G.xs[i] - G.xs[i - 1])};
-                    if (i < i1) nb[k++] = {n + 1, i + 1, j, l, static_cast<double>(G.xs[i + 1] - G.xs[i])};
+            if (li > 0) {
+                if (G.hor[li]) {
+                    if (i > i0) nb[k++] = {n - 1, i - 1, j, li, static_cast<double>(G.xs[i] - G.xs[i - 1])};
+                    if (i < i1) nb[k++] = {n + 1, i + 1, j, li, static_cast<double>(G.xs[i + 1] - G.xs[i])};
                 } else {
-                    if (j > j0) nb[k++] = {n - G.nx, i, j - 1, l, static_cast<double>(G.ys[j] - G.ys[j - 1])};
-                    if (j < j1) nb[k++] = {n + G.nx, i, j + 1, l, static_cast<double>(G.ys[j + 1] - G.ys[j])};
+                    if (j > j0) nb[k++] = {n - nx32, i, j - 1, li, static_cast<double>(G.ys[j] - G.ys[j - 1])};
+                    if (j < j1) nb[k++] = {n + nx32, i, j + 1, li, static_cast<double>(G.ys[j + 1] - G.ys[j])};
                 }
-                if (l > 1 || usable(n - layer_size, id)) nb[k++] = {n - layer_size, i, j, l - 1, via_cost_up[l - 1]};
-                // short wrong-way jogs (to the next track), dearer than a step along the track:
-                // they save the two vias of a hop over the other layer
+                if (li > 1 || usable(n - layer_size, id)) nb[k++] = {n - layer_size, i, j, li - 1, via_cost_up[li - 1]};
                 if (opt.wrong_way > 0) {
-                    if (G.hor[l]) {
-                        if (j > j0) nb[k++] = {n - G.nx, i, j - 1, l, opt.wrong_way * static_cast<double>(G.ys[j] - G.ys[j - 1])};
-                        if (j < j1) nb[k++] = {n + G.nx, i, j + 1, l, opt.wrong_way * static_cast<double>(G.ys[j + 1] - G.ys[j])};
+                    if (G.hor[li]) {
+                        if (j > j0) nb[k++] = {n - nx32, i, j - 1, li, opt.wrong_way * static_cast<double>(G.ys[j] - G.ys[j - 1])};
+                        if (j < j1) nb[k++] = {n + nx32, i, j + 1, li, opt.wrong_way * static_cast<double>(G.ys[j + 1] - G.ys[j])};
                     } else {
-                        if (i > i0) nb[k++] = {n - 1, i - 1, j, l, opt.wrong_way * static_cast<double>(G.xs[i] - G.xs[i - 1])};
-                        if (i < i1) nb[k++] = {n + 1, i + 1, j, l, opt.wrong_way * static_cast<double>(G.xs[i + 1] - G.xs[i])};
+                        if (i > i0) nb[k++] = {n - 1, i - 1, j, li, opt.wrong_way * static_cast<double>(G.xs[i] - G.xs[i - 1])};
+                        if (i < i1) nb[k++] = {n + 1, i + 1, j, li, opt.wrong_way * static_cast<double>(G.xs[i + 1] - G.xs[i])};
                     }
                 }
             }
-            if (l + 1 < G.nl) nb[k++] = {n + layer_size, i, j, l + 1, via_cost_up[l]};
+            if (li + 1 < G.nl) nb[k++] = {n + layer_size, i, j, li + 1, via_cost_up[li]};
             for (int q = 0; q < k; ++q) {
                 const Nb& e = nb[q];
                 Node m = e.m;
                 if (!usable(m, id)) continue;
-                if (e.l == 0 && target[m] != search) continue;   // Metal1 only at this pin's access points
-                float c = static_cast<float>(dist[n] + nodeCostAt(m, e.i, e.j, e.l, id, e.base));
-                if (seen[m] == search && dist[m] <= c) continue;
-                seen[m] = search;
-                dist[m] = c;
-                parent[m] = n;
-                pq.push({c + static_cast<float>(hAt(e.i, e.j)), c, m});
+                if (e.l == 0 && ctx.target[m] != cur_search) continue;   // Metal1 only at this pin's access points
+                float c = static_cast<float>(ctx.dist[n] + nodeCostAt(ctx, m, e.i, e.j, e.l, id, e.base, all_guides));
+                if (ctx.seen[m] == cur_search && ctx.dist[m] <= c) continue;
+                ctx.seen[m] = cur_search;
+                ctx.dist[m] = c;
+                ctx.parent[m] = n;
+                ctx.pq.push({c + static_cast<float>(hAt(e.i, e.j)), c, m});
             }
         }
         if (found == kNone) {
             if (trace_search) {
                 int reached = 0;
                 double best_h = 1e300;
-                for (size_t q = 0; q < N; ++q) if (seen[q] == search) { reached++; best_h = std::min(best_h, h(static_cast<Node>(q))); }
+                for (size_t q = 0; q < N; ++q) if (ctx.seen[q] == cur_search) { reached++; best_h = std::min(best_h, h(static_cast<Node>(q))); }
                 fprintf(stderr, "   search failed: %d nodes reached, closest %.2f um from the pin, window %d..%d x %d..%d\n", reached, best_h / lef.dbu, i0, i1, j0, j1);
-                for (Node t : p.terms)
-                    fprintf(stderr, "     target L%d (%.2f, %.2f) blocked=%d owner=%d id=%d occ=%d seen=%d\n", G.Lr(t), G.xs[G.I(t)] / (double)lef.dbu, G.ys[G.J(t)] / (double)lef.dbu,
-                            blocked[t], pin_owner[t], id, occ[t], seen[t] == search);
-                for (size_t q = 0; q < N; ++q) {
-                    if (seen[q] != search || h(static_cast<Node>(q)) > 0) continue;
-                    Node m = static_cast<Node>(q);
-                    Node up = G.Lr(m) + 1 < G.nl ? m + static_cast<Node>(static_cast<size_t>(G.nx) * G.ny) : kNone;
-                    fprintf(stderr, "     reached L%d (%.2f, %.2f); above: blocked=%d owner=%d target=%d\n", G.Lr(m), G.xs[G.I(m)] / (double)lef.dbu, G.ys[G.J(m)] / (double)lef.dbu,
-                            up == kNone ? -1 : blocked[up], up == kNone ? -9 : pin_owner[up], up == kNone ? -1 : target[up] == search);
-                }
             }
             return false;
         }
-        std::vector<Node> path;
-        for (Node n = found; n != kNone; n = parent[n]) path.push_back(n);
-        for (size_t q = 0; q + 1 < path.size(); ++q) net.edges.push_back({path[q + 1], path[q]});
-        for (Node n : path) occupy(net, id, n);
+        ctx.path.clear();
+        for (Node n = found; n != kNone; n = ctx.parent[n]) ctx.path.push_back(n);
+        for (size_t q = 0; q + 1 < ctx.path.size(); ++q) net.edges.push_back({ctx.path[q + 1], ctx.path[q]});
+        for (Node n : ctx.path) occupy(ctx, net, id, n);
         return true;
     };
     auto ripUp = [&](RNet& net) {
@@ -909,69 +1018,142 @@ DrouteResult detailedRoute(const Floorplan& fp, const CellNetlist& nl, const Lef
         net.used.clear();
         net.edges.clear();
     };
-    auto routeNet = [&](int id, int margin) {
+    auto routeNet = [&](SearchCtx& ctx, int id, int margin, bool allow_fallback) -> bool {
         RNet& net = nets[id];
-        stamp++;
-        if (guide_of[net.netlist_net] >= 0) {
+        ctx.nextMark();
+        bool all_guides = (guide_of[net.netlist_net] < 0);
+        if (!all_guides) {
+            ctx.guide_stamp++;
             for (const auto& g : gr.guides[guide_of[net.netlist_net]].second) {
                 int x0 = static_cast<int>(g.rect.x0 / gr.gcell) - 1, x1 = static_cast<int>((g.rect.x1 - 1) / gr.gcell) + 1;
                 int y0 = static_cast<int>(g.rect.y0 / gr.gcell) - 1, y1 = static_cast<int>((g.rect.y1 - 1) / gr.gcell) + 1;
                 for (int y = std::max(0, y0); y <= std::min(ggy - 1, y1); ++y)
-                    for (int x = std::max(0, x0); x <= std::min(ggx - 1, x1); ++x) in_guide[static_cast<size_t>(y) * ggx + x] = stamp;
+                    for (int x = std::max(0, x0); x <= std::min(ggx - 1, x1); ++x) ctx.in_guide[static_cast<size_t>(y) * ggx + x] = ctx.guide_stamp;
                 int gl = layerOf(g.layer);
                 if (gl < 0) continue;
                 int ax0 = static_cast<int>(g.rect.x0 / gr.gcell), ax1 = static_cast<int>((g.rect.x1 - 1) / gr.gcell);
                 int ay0 = static_cast<int>(g.rect.y0 / gr.gcell), ay1 = static_cast<int>((g.rect.y1 - 1) / gr.gcell);
                 for (int y = std::max(0, ay0); y <= std::min(ggy - 1, ay1); ++y)
                     for (int x = std::max(0, ax0); x <= std::min(ggx - 1, ax1); ++x)
-                        in_layer_guide[(static_cast<size_t>(y) * ggx + x) * G.nl + gl] = stamp;
+                        ctx.in_layer_guide[(static_cast<size_t>(y) * ggx + x) * G.nl + gl] = ctx.guide_stamp;
             }
-        } else {
-            // local net (inside one gcell): any layer
-            std::fill(in_guide.begin(), in_guide.end(), stamp);
-            std::fill(in_layer_guide.begin(), in_layer_guide.end(), stamp);
         }
-        // pins in Prim order from the first one
-        std::vector<int> order{0};
-        std::vector<char> taken(net.pins.size(), 0);
-        taken[0] = 1;
-        for (size_t k = 1; k < net.pins.size(); ++k) {
-            int best = -1;
-            double bd = 1e300;
-            for (size_t q = 0; q < net.pins.size(); ++q) {
-                if (taken[q]) continue;
-                for (int o : order) {
-                    double d = std::fabs(net.pins[q].cx - net.pins[o].cx) + std::fabs(net.pins[q].cy - net.pins[o].cy);
-                    if (d < bd) { bd = d; best = static_cast<int>(q); }
-                }
-            }
-            taken[best] = 1;
-            order.push_back(best);
-        }
-        std::vector<Node> tree = net.pins[order[0]].terms;
+        ctx.tree = net.pins[net.pin_order[0]].terms;
         net.ok = true;
         int mi = std::max(1, static_cast<int>(margin * gr.gcell / sx)), mj = std::max(1, static_cast<int>(margin * gr.gcell / sy));
-        for (size_t k = 1; k < order.size(); ++k) {
-            const Pin& p = net.pins[order[k]];
-            int i0 = std::max(0, net.gx0 - mi), i1 = std::min(G.nx - 1, net.gx1 + mi);
-            int j0 = std::max(0, net.gy0 - mj), j1 = std::min(G.ny - 1, net.gy1 + mj);
-            bool ok = connect(net, id, tree, p, i0, j0, i1, j1);
-            stat_searches++;
-            if (!ok) { stat_fallbacks++; ok = connect(net, id, tree, p, 0, 0, G.nx - 1, G.ny - 1); }
+        int i0 = std::max(0, net.gx0 - mi), i1 = std::min(G.nx - 1, net.gx1 + mi);
+        int j0 = std::max(0, net.gy0 - mj), j1 = std::min(G.ny - 1, net.gy1 + mj);
+        const int loc_mi = std::max(mi, static_cast<int>(2 * gr.gcell / sx));
+        const int loc_mj = std::max(mj, static_cast<int>(2 * gr.gcell / sy));
+        for (size_t k = 1; k < net.pin_order.size(); ++k) {
+            const Pin& p = net.pins[net.pin_order[k]];
+            bool ok = false;
+            // Fast local pin-to-nearest-tree window first for multi-pin nets (avoids scanning huge net bboxes)
+            if (net.pin_order.size() > 2 && !p.terms.empty() && !ctx.tree.empty()) {
+                int pi = G.I(p.terms[0]), pj = G.J(p.terms[0]);
+                int best_ti = G.I(ctx.tree[0]), best_tj = G.J(ctx.tree[0]);
+                int best_d = std::abs(pi - best_ti) + std::abs(pj - best_tj);
+                for (Node tn : ctx.tree) {
+                    int ti = G.I(tn), tj = G.J(tn);
+                    int d = std::abs(pi - ti) + std::abs(pj - tj);
+                    if (d < best_d) { best_d = d; best_ti = ti; best_tj = tj; }
+                }
+                int li0 = std::max(i0, std::min(pi, best_ti) - loc_mi);
+                int li1 = std::min(i1, std::max(pi, best_ti) + loc_mi);
+                int lj0 = std::max(j0, std::min(pj, best_tj) - loc_mj);
+                int lj1 = std::min(j1, std::max(pj, best_tj) + loc_mj);
+                if ((li1 - li0 + 1) * (lj1 - lj0 + 1) < (i1 - i0 + 1) * (j1 - j0 + 1)) {
+                    ok = connect(ctx, net, id, ctx.tree, p, li0, lj0, li1, lj1, all_guides);
+                    ctx.stat_searches++;
+                }
+            }
+            if (!ok) {
+                ok = connect(ctx, net, id, ctx.tree, p, i0, j0, i1, j1, all_guides);
+                ctx.stat_searches++;
+            }
+            if (!ok) {
+                if (!allow_fallback) {
+                    ripUp(net);
+                    return false;
+                }
+                ctx.stat_fallbacks++;
+                ok = connect(ctx, net, id, ctx.tree, p, 0, 0, G.nx - 1, G.ny - 1, all_guides);
+            }
             if (!ok) { net.ok = false; continue; }
-            // the tree grows by the routed nodes (Metal1 access points only once used)
-            tree.clear();
-            for (Node n : net.used) tree.push_back(n);
+            ctx.tree = net.used;
         }
-        // the first pin's unused access points stay out of the tree from now on
+        return true;
     };
+
+    // Route a list of nets: serially when n_threads == 1, or in disjoint spatial waves when n_threads > 1
+    auto routeBatch = [&](const std::vector<int>& batch, int margin) {
+        if (n_threads <= 1 || batch.size() < 4) {
+            for (int id : batch) routeNet(ctxs[0], id, margin, true);
+            return;
+        }
+        int mi = std::max(1, static_cast<int>(margin * gr.gcell / sx));
+        int mj = std::max(1, static_cast<int>(margin * gr.gcell / sy));
+        struct Box { int x0, y0, x1, y1, id; };
+        std::vector<std::vector<Box>> waves;
+        std::vector<int> serial_only;
+        const long full_area = static_cast<long>(G.nx) * G.ny;
+        for (int id : batch) {
+            const RNet& net = nets[id];
+            int x0 = std::max(0, net.gx0 - mi) - 2, x1 = std::min(G.nx - 1, net.gx1 + mi) + 2;
+            int y0 = std::max(0, net.gy0 - mj) - 2, y1 = std::min(G.ny - 1, net.gy1 + mj) + 2;
+            long area = static_cast<long>(x1 - x0 + 1) * (y1 - y0 + 1);
+            if (net.has_escape || area * 3 > full_area) {
+                serial_only.push_back(id);
+                continue;
+            }
+            Box b{x0, y0, x1, y1, id};
+            bool placed = false;
+            for (auto& w : waves) {
+                bool clash = false;
+                for (const Box& o : w) {
+                    if (!(b.x1 < o.x0 || o.x1 < b.x0 || b.y1 < o.y0 || o.y1 < b.y0)) { clash = true; break; }
+                }
+                if (!clash) { w.push_back(b); placed = true; break; }
+            }
+            if (!placed) waves.push_back({b});
+        }
+        for (const auto& w : waves) {
+            if (w.size() < 4) {
+                for (const Box& b : w) routeNet(ctxs[0], b.id, margin, true);
+                continue;
+            }
+            int workers = std::min<int>(n_threads, static_cast<int>(w.size()));
+            std::atomic<size_t> next_idx{0};
+            std::vector<std::vector<int>> deferred(static_cast<size_t>(workers));
+            std::vector<std::thread> pool;
+            pool.reserve(static_cast<size_t>(workers));
+            for (int t = 0; t < workers; ++t) {
+                pool.emplace_back([&, t]() {
+                    for (;;) {
+                        size_t idx = next_idx.fetch_add(1, std::memory_order_relaxed);
+                        if (idx >= w.size()) break;
+                        int id = w[idx].id;
+                        if (!routeNet(ctxs[t], id, margin, false)) {
+                            deferred[t].push_back(id);
+                        }
+                    }
+                });
+            }
+            for (auto& th : pool) th.join();
+            for (const auto& dv : deferred) {
+                for (int id : dv) routeNet(ctxs[0], id, margin, true);
+            }
+        }
+        for (int id : serial_only) routeNet(ctxs[0], id, margin, true);
+    };
+
     std::vector<int> order(nets.size());
     std::iota(order.begin(), order.end(), 0);
     std::sort(order.begin(), order.end(), [&](int a, int b) {
         long ha = (nets[a].gx1 - nets[a].gx0) + (nets[a].gy1 - nets[a].gy0), hb = (nets[b].gx1 - nets[b].gx0) + (nets[b].gy1 - nets[b].gy0);
         return ha != hb ? ha < hb : a < b;
     });
-    for (int id : order) routeNet(id, 1);
+    routeBatch(order, 1);
 
     // Conflicts: a node used by two nets, or two nets on adjacent nodes of one track
     std::vector<char> pad(N, 0);
@@ -987,9 +1169,11 @@ DrouteResult detailedRoute(const Floorplan& fp, const CellNetlist& nl, const Lef
         }
         if (l == 1 && have_via1v) pad_half[l] = std::max(pad_half[l], (G.hor[l] ? via1v.top.width() : via1v.top.height()) / 2);
     }
+    std::vector<char> multi(N, 0);
+    std::vector<int> pown(nl.netCount() > 0 ? N : 0, -1);
     auto conflicts = [&](std::vector<char>* bad_net) {
         std::fill(who.begin(), who.end(), -1);
-        std::vector<char> multi(N, 0);
+        std::fill(multi.begin(), multi.end(), 0);
         for (size_t id = 0; id < nets.size(); ++id) {
             for (Node n : nets[id].used) {
                 if (who[n] == -1) who[n] = static_cast<int>(id);
@@ -997,9 +1181,8 @@ DrouteResult detailedRoute(const Floorplan& fp, const CellNetlist& nl, const Lef
             }
         }
         long count = 0;
-        std::vector<Node> bad;
         // a reserved partner node that another net uses (or reserves) is a conflict for both
-        std::vector<int> pown(nl.netCount() > 0 ? N : 0, -1);
+        std::fill(pown.begin(), pown.end(), -1);
         for (size_t id = 0; id < nets.size(); ++id) {
             for (Node n : nets[id].partners) {
                 bool c = (who[n] >= 0 && who[n] != static_cast<int>(id)) || (pown[n] >= 0 && pown[n] != static_cast<int>(id));
@@ -1015,17 +1198,12 @@ DrouteResult detailedRoute(const Floorplan& fp, const CellNetlist& nl, const Lef
                 }
             }
         }
-        // Certification: the router keeps the cautious rule (no two nets on neighbouring nodes of
-        // a track); a pair it still left behind is a real conflict only if the actual shapes come
-        // closer than the layer's spacing. A wire end reaches half a width past its node, a via
-        // pad half a pad length; on Metal3 (nodes 0.48 um apart) two wire ends or a pad and a
-        // wire end are legal, on Metal2/Metal4 (0.42 um) two wire ends are.
-        std::fill(pad.begin(), pad.end(), 0);
+        // Certification using precomputed dense is_pad_node table (zero hash lookups)
+        std::memcpy(pad.data(), is_pad_node.data(), N);
         for (size_t id = 0; id < nets.size(); ++id) {
             for (auto [a, b] : nets[id].edges) {
                 if (G.Lr(a) != G.Lr(b)) { pad[a] = 1; pad[b] = 1; }
             }
-            for (Node n : nets[id].used) if (offgrid.count(n) || escape_of.count(n)) pad[n] = 1;
         }
         auto legalPair = [&](Node a, Node b) {
             int l = G.Lr(a);
@@ -1050,17 +1228,23 @@ DrouteResult detailedRoute(const Floorplan& fp, const CellNetlist& nl, const Lef
         return count;
     };
     const bool trace = std::getenv("FASTPNR_TRACE") != nullptr;
+    auto sumStats = [&]() {
+        long s = 0, f = 0, p = 0;
+        for (const auto& c : ctxs) { s += c.stat_searches; f += c.stat_fallbacks; p += c.stat_pops; }
+        return std::tuple<long, long, long>{s, f, p};
+    };
     long best = conflicts(nullptr);
-    if (trace) fprintf(stderr, "dr initial conflicts %ld after %.0f ms (%ld searches, %ld fallbacks, %ld nodes expanded)\n", best, msSince(t1), stat_searches,
-                       stat_fallbacks, stat_pops);
+    if (trace) {
+        auto [ss, sf, sp] = sumStats();
+        fprintf(stderr, "dr initial conflicts %ld after %.0f ms (%ld searches, %ld fallbacks, %ld nodes expanded)\n", best, msSince(t1), ss, sf, sp);
+    }
     int stall = 0;
+    std::vector<int> victim_list;
     for (int it = 1; it <= opt.max_iterations && best > 0; ++it) {
         res.iterations = it;
         std::vector<char> bad(nets.size(), 0);
         conflicts(&bad);
         pres *= 1.5;
-        // Stuck for a few rounds: also reroute every net near a conflict, so the neighbours the
-        // conflicting nets would have to squeeze past can move too
         if (stall >= 3) {
             std::vector<char> core = bad;
             for (size_t id = 0; id < nets.size(); ++id) {
@@ -1073,7 +1257,6 @@ DrouteResult detailedRoute(const Floorplan& fp, const CellNetlist& nl, const Lef
                         for (int q = 0; q < k; ++q) hot |= who[nb[q]] >= 0 && who[nb[q]] != static_cast<int>(id);
                         if (!hot) continue;
                     }
-                    // the longer it stays stuck, the wider the neighbourhood
                     const int rad = std::min(5, 3 + 2 * ((stall - 3) / 3));
                     int ci = G.I(n), cj = G.J(n);
                     for (int l = 1; l < G.nl; ++l)
@@ -1084,31 +1267,41 @@ DrouteResult detailedRoute(const Floorplan& fp, const CellNetlist& nl, const Lef
                                 Node m = G.id(i, j, l);
                                 int w = who[m];
                                 if (w >= 0) bad[w] = 1;
-                                // the whole pocket gets more expensive, so nets passing through
-                                // it that have another way leave room for the stuck ones
                                 hist[m] += 0.25f;
                             }
                 }
             }
         }
-        int victims = 0;
+        victim_list.clear();
         for (int id : order) {
             if (!bad[id]) continue;
-            victims++;
             ripUp(nets[id]);
-            routeNet(id, 1 + it / 4);
+            victim_list.push_back(id);
         }
+        routeBatch(victim_list, 1 + it / 4);
         long c = conflicts(nullptr);
-        if (trace) fprintf(stderr, "dr iter %d victims %d conflicts %ld at %.0f ms (%ld searches, %ld fallbacks, %ld nodes expanded)\n", it, victims, c, msSince(t1),
-                           stat_searches, stat_fallbacks, stat_pops);
-        if (c < best) { best = c; stall = 0; }
-        else if (++stall >= opt.patience) break;
+        if (trace) {
+            auto [ss, sf, sp] = sumStats();
+            fprintf(stderr, "dr iter %d victims %zu conflicts %ld at %.0f ms (%ld searches, %ld fallbacks, %ld nodes expanded)\n", it, victim_list.size(), c,
+                    msSince(t1), ss, sf, sp);
+        }
+        if (c < best && !(victim_list.size() <= 30 && best - c <= 4 && c > 4)) { best = c; stall = 0; }
+        else { if (c < best) best = c; if (++stall >= opt.patience) break; }
     }
     res.conflicts = conflicts(nullptr);
     res.ms_route = msSince(t1);
 
     // ------------------------------------------------ finishing: gaps, minimum area, output
     auto t2 = std::chrono::steady_clock::now();
+    std::vector<int> mark(N, 0);
+    int stamp = 0;
+    auto occupyFinish = [&](RNet& net, int id, Node n) {
+        if (mark[n] == stamp) return;
+        mark[n] = stamp;
+        net.used.push_back(n);
+        occ[n]++;
+        who[n] = id;
+    };
     for (size_t id = 0; id < nets.size(); ++id) {
         RNet& net = nets[id];
         if (!net.ok) res.unrouted++;
@@ -1156,7 +1349,9 @@ DrouteResult detailedRoute(const Floorplan& fp, const CellNetlist& nl, const Lef
             return runs;
         };
         // minimum area: extend short runs along their track into free nodes
-        for (auto [l, t, lo, hi] : runsOf()) {
+        for (const auto& run : runsOf()) {
+            const int l = std::get<0>(run), t = std::get<1>(run);
+            int lo = std::get<2>(run), hi = std::get<3>(run);
             const LefLayer& L = lef.layers[G.lef[l]];
             if (L.min_area <= 0) continue;
             auto coord = [&](int p) { return static_cast<double>(G.hor[l] ? G.xs[p] : G.ys[p]); };
@@ -1184,7 +1379,7 @@ DrouteResult detailedRoute(const Floorplan& fp, const CellNetlist& nl, const Lef
                     Node a = nodeOf(side > 0 ? hi : lo), b = nodeOf(p);
                     net.edges.push_back({a, b});
                     eset[{std::min(a, b), std::max(a, b)}] = 1;
-                    occupy(net, static_cast<int>(id), b);
+                    occupyFinish(net, static_cast<int>(id), b);
                     if (side > 0) hi = p; else lo = p;
                     grew = true;
                 }

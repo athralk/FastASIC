@@ -1,4 +1,5 @@
 #include "../include/timer.hpp"
+#include "../include/spef.hpp"
 #include <algorithm>
 #include <array>
 #include <chrono>
@@ -173,6 +174,16 @@ class Timer {
             int net = nl.port_bits[p].net;
             if (net > CellNetlist::kConst1) {
                 for (double& c : net_cap[net]) c += load;
+            }
+        }
+        // Extracted wire capacitance from SPEF (added to every corner/edge load of that net)
+        if (options.spef) {
+            for (size_t n = 2; n < nl.netCount(); ++n) {
+                auto it = options.spef->nets.find(nl.net_names[n]);
+                if (it != options.spef->nets.end()) {
+                    double wc = it->second.wire_cap_ff;
+                    for (double& c : net_cap[n]) c += wc;
+                }
             }
         }
 
@@ -414,12 +425,22 @@ class Timer {
                 int d = net_driver[node.net];
                 if (d < 0) continue;
                 double convert = slew_frac[n] / slew_frac[d];   // 1 unless the libraries differ
-                for (Edge e : kEdges) {   // ideal wire: same arrival and slew as the driver
+                double wire_dly_ps = 0.0;
+                if (options.spef) {
+                    auto it = options.spef->nets.find(nl.net_names[node.net]);
+                    if (it != options.spef->nets.end()) {
+                        const NetParasitics& np = it->second;
+                        auto pit = np.pin_elmore_ps.find(nodeName(n));
+                        wire_dly_ps = (pit != np.pin_elmore_ps.end()) ? pit->second : np.default_elmore_ps;
+                    }
+                }
+                double wire_slew_ps = 2.2 * wire_dly_ps; // Bakoglu 10-90%/20-80% RC slew degradation
+                for (Edge e : kEdges) {
                     size_t i = static_cast<size_t>(n) * 2 + e, j = static_cast<size_t>(d) * 2 + e;
-                    arr_max[i] = arr_max[j];
-                    arr_min[i] = arr_min[j];
-                    slew_max[i] = slew_max[j] * convert;
-                    slew_min[i] = slew_min[j] < kInf ? slew_min[j] * convert : kInf;
+                    arr_max[i] = arr_max[j] > -kInf ? arr_max[j] + wire_dly_ps : -kInf;
+                    arr_min[i] = arr_min[j] < kInf ? arr_min[j] + wire_dly_ps : kInf;
+                    slew_max[i] = std::hypot(slew_max[j], wire_slew_ps) * convert;
+                    slew_min[i] = slew_min[j] < kInf ? std::hypot(slew_min[j], wire_slew_ps) * convert : kInf;
                     pred_max[i] = pred_min[i] = static_cast<int>(j);
                 }
                 continue;
