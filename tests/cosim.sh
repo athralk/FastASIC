@@ -19,7 +19,10 @@ TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
 
 "$BIN" -q "$@" -o "$TMP/netlist.v" "$SRC" > "$TMP/log.txt"
-if [ -n "${COSIM_MUTATE:-}" ]; then sed -i -E "$COSIM_MUTATE" "$TMP/netlist.v"; fi
+if [ -n "${COSIM_MUTATE:-}" ]; then
+    sed -E "$COSIM_MUTATE" "$TMP/netlist.v" > "$TMP/mutated.v"
+    mv "$TMP/mutated.v" "$TMP/netlist.v"
+fi
 yosys -q -p "read_verilog $SRC; hierarchy -auto-top; proc; write_json $TMP/ports.json"
 
 python3 - "$TMP" "$VECTORS" <<'PY'
@@ -86,12 +89,12 @@ module tb;
 endmodule
 ''')
 PY
-models=()
-for m in $(grep -oE '\bRM_IHPSG13_[A-Za-z0-9_]+' "$TMP/netlist.v" | sort -u); do models+=("$VDIR/$m.v"); done
-if [ ${#models[@]} -gt 0 ]; then
-    models+=("$VDIR/RM_IHPSG13_1P_core_behavioral_bm_bist.v" "$VDIR/RM_IHPSG13_2P_core_behavioral_bm_bist_ideal.v")
+sources=("$TMP/tb.v" "$SRC" "$TMP/netlist.v")
+for m in $(grep -oE '\bRM_IHPSG13_[A-Za-z0-9_]+' "$TMP/netlist.v" | sort -u); do sources+=("$VDIR/$m.v"); done
+if [ ${#sources[@]} -gt 3 ]; then
+    sources+=("$VDIR/RM_IHPSG13_1P_core_behavioral_bm_bist.v" "$VDIR/RM_IHPSG13_2P_core_behavioral_bm_bist_ideal.v")
 fi
-iverilog -g2005 -DFUNCTIONAL -I "$(dirname "$SRC")" -o "$TMP/sim" "$TMP/tb.v" "$SRC" "$TMP/netlist.v" "${models[@]}" 2> "$TMP/iverilog.log" || {
+iverilog -g2005 -DFUNCTIONAL -I "$(dirname "$SRC")" -o "$TMP/sim" "${sources[@]}" 2> "$TMP/iverilog.log" || {
     cat "$TMP/iverilog.log"; exit 2; }
 vvp -n "$TMP/sim" > "$TMP/sim.log"
 grep -vE "^VCD|A_DLY" "$TMP/sim.log" | tail -n 6

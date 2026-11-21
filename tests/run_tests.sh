@@ -72,6 +72,8 @@ for a in "$DIR"/equiv/fail/*.a.v; do
     check "different   $(basename "${a%.a.v}")" 1 "FAIL" "$BIN" --equiv "$a" "${a%.a.v}.b.v"
 done
 
+check "explicit equivalence cannot skip the proof" 2 "--equiv requires sat or sim" "$BIN" --equiv-method none --equiv "$DIR/equiv/fail/and_vs_or.a.v" "$DIR/equiv/fail/and_vs_or.b.v"
+
 echo "Equivalence checker (simulation):"
 for a in "$DIR"/equiv/pass/*.a.v; do
     check "equivalent  $(basename "${a%.a.v}")" 0 "PASS" "$BIN" --equiv-method sim --equiv "$a" "${a%.a.v}.b.v"
@@ -205,6 +207,15 @@ echo "Physical design (fastpnr: floorplan, placement, global routing; every resu
 echo "OpenROAD also checks the floorplans with FASTASIC_OPENROAD=1, IHP's DRC and LVS decks the routes with FASTASIC_SIGNOFF=1):"
 if [ -f "$PDK_LIB" ] && [ -x "$PNR" ]; then
     FP_TMP=$(mktemp -d)
+    check "both clock domains get balanced trees" 0 "Clock tree buffers: 4, high-fanout nets buffered: 0" \
+        "$BIN" -q --map delay -o "$FP_TMP/domains.v" "$DIR/seq/clock_domains.v"
+    check "buffer names survive a structural Verilog round trip" 0 "80 registers" "$LSTA" -q "$FP_TMP/domains.v"
+    check "SPEF requires detailed routing" 2 "-spef requires -droute" \
+        "$PNR" -spef "$FP_TMP/invalid.spef" "$DIR/../bench/sta/netlists/acc16.v"
+    pdk_lef_dir=$(dirname "$(dirname "$PDK_LIB")")/lef
+    check "an inaccessible two-pin net is an open" 1 "1 nets not fully connected" \
+        "$PNR" -droute -lef "$pdk_lef_dir/sg13cmos5l_tech.lef" -lef "$pdk_lef_dir/sg13cmos5l_stdcell.lef" \
+        -lef "$DIR/pnr/inaccessible.lef" "$DIR/pnr/inaccessible.v"
     # a 52k-cell design: 8 copies of mac32 (generated, too large to keep in the repo)
     python3 "$DIR/../tools/replicate_netlist.py" "$DIR/../bench/sta/netlists/mac32.v" 8 > "$FP_TMP/mac32_x8.v"
     for f in "$DIR"/../bench/sta/netlists/*.v "$FP_TMP/mac32_x8.v"; do
@@ -266,7 +277,7 @@ if command -v iverilog > /dev/null && command -v yosys > /dev/null; then
             check "$(basename "$f") --adder $style" 0 "PASS" bash "$DIR/cosim.sh" "$BIN" "$f" 20000 --adder "$style"
         done
     done
-    export COSIM_MUTATE='0,/~\(/s//(/'
+    export COSIM_MUTATE='1,/~\(/s/~\(/(/'
     check "co-simulation catches a planted bug (an inversion removed)" 1 "FAIL" bash "$DIR/cosim.sh" "$BIN" "$DIR/lang/multipliers.v" 20000
     unset COSIM_MUTATE
 else

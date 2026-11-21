@@ -2,15 +2,35 @@
 #include <algorithm>
 #include <cstdint>
 #include <functional>
-#include <queue>
+#include <unordered_set>
 #include <stdexcept>
 #include <utility>
 #include <vector>
 
 namespace {
 
+// Verilog instances and nets share a namespace, including declared vector port names.
+class BufferNames {
+    std::unordered_set<std::string> used;
+public:
+    explicit BufferNames(const CellNetlist& nl) : used(nl.net_names.begin(), nl.net_names.end()) {
+        for (const auto& port : nl.ports) used.insert(port.name);
+        for (const auto& inst : nl.instances) used.insert(inst.name);
+    }
+
+    std::string reserve(const std::string& base) {
+        std::string name = base;
+        for (size_t suffix = 1; used.count(name) || used.count(name + "_n"); ++suffix) {
+            name = base + "_" + std::to_string(suffix);
+        }
+        used.insert(name);
+        used.insert(name + "_n");
+        return name;
+    }
+};
+
 // Rebuilds `sinks` on `root_net` into a balanced tree of `buf` cells with fanout <= `max_fanout`.
-void buildBalancedTree(CellNetlist& nl, const LibCell* buf, int in_pin, int out_pin, int root_net,
+void buildBalancedTree(CellNetlist& nl, BufferNames& names, const LibCell* buf, int in_pin, int out_pin, int root_net,
                        std::vector<std::pair<int, int>> level, int max_fanout, const std::string& prefix,
                        int& buffers_out, int& levels_out) {
     while (static_cast<int>(level.size()) > max_fanout) {
@@ -19,7 +39,7 @@ void buildBalancedTree(CellNetlist& nl, const LibCell* buf, int in_pin, int out_
         std::vector<std::pair<int, int>> next;
         next.reserve(groups);
         for (size_t g = 0; g < groups; ++g) {
-            std::string name = prefix + "_L" + std::to_string(levels_out) + "_" + std::to_string(g);
+            std::string name = names.reserve(prefix + "_L" + std::to_string(levels_out) + "_" + std::to_string(g));
             int net = nl.addNet(name + "_n");
             CellNetlist::Instance inst;
             inst.name = name;
@@ -77,7 +97,9 @@ ClockTreeReport insertClockTree(CellNetlist& nl, const Library& lib, const std::
     }
     ClockTreeReport report;
     report.sinks = static_cast<int>(level.size());
-    buildBalancedTree(nl, buf, in_pin, out_pin, root, std::move(level), options.max_fanout, "cts", report.buffers, report.levels);
+    if (report.sinks <= options.max_fanout) return report;
+    BufferNames names(nl);
+    buildBalancedTree(nl, names, buf, in_pin, out_pin, root, std::move(level), options.max_fanout, "cts", report.buffers, report.levels);
     return report;
 }
 
@@ -109,11 +131,12 @@ BufferNetsReport bufferHighFanoutNets(CellNetlist& nl, const Library& lib, int m
         }
     }
 
+    BufferNames names(nl);
     for (size_t n = 2; n < orig_nets; ++n) {
         if (skip_nets.count(static_cast<int>(n))) continue;
         if (static_cast<int>(sinks[n].size()) <= max_fanout) continue;
         int lvls = 0;
-        buildBalancedTree(nl, buf, in_pin, out_pin, static_cast<int>(n), std::move(sinks[n]), max_fanout,
+        buildBalancedTree(nl, names, buf, in_pin, out_pin, static_cast<int>(n), std::move(sinks[n]), max_fanout,
                           "hfn_" + std::to_string(n), report.buffers_added, lvls);
         report.buffered_nets++;
     }
@@ -178,6 +201,7 @@ int repairFastHoldPaths(CellNetlist& nl, const Library& lib, int max_short_hops,
         return {best_min, worst_max};
     };
 
+    BufferNames names(nl);
     int added = 0;
     for (size_t i = 0; i < n_insts; ++i) {
         if (!nl.instances[i].cell->is_sequential) continue;
@@ -203,7 +227,7 @@ int repairFastHoldPaths(CellNetlist& nl, const Library& lib, int max_short_hops,
                 const LibCell* chosen = use_dly ? dly : fast_buf;
                 int cp_in = use_dly ? in_pin : fin_pin;
                 int cp_out = use_dly ? out_pin : fout_pin;
-                std::string bname = "hold_buf_" + std::to_string(added++);
+                std::string bname = names.reserve("hold_buf_" + std::to_string(added++));
                 int dnet = nl.addNet(bname + "_n");
                 CellNetlist::Instance binst;
                 binst.name = bname;

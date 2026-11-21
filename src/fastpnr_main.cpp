@@ -110,6 +110,10 @@ int main(int argc, char* argv[]) {
             else netlist_path = a;
         }
         if (netlist_path.empty()) return usage();
+        if (!spef_path.empty() && (!place || !route || !droute)) {
+            std::cerr << "fastpnr: -spef requires -droute with placement and routing enabled\n";
+            return 2;
+        }
 
         auto t0 = std::chrono::steady_clock::now();
         std::string base = pdkBase();

@@ -500,7 +500,11 @@ DrouteResult detailedRoute(const Floorplan& fp, const CellNetlist& nl, const Lef
         return G.id(static_cast<int>(ix - G.xs.begin()), static_cast<int>(iy - G.ys.begin()), l);
     };
     std::vector<std::vector<Pin>> pins_of(nl.netCount());
-    std::vector<char> missing_pin(nl.netCount(), 0);
+    std::vector<int> missing_pins(nl.netCount(), 0);
+    auto missingAccess = [&](int net) {
+        ++res.pins_without_access;
+        ++missing_pins[net];
+    };
     int owner_clash = 0;
     auto claim = [&](Node n, int net) {
         if (pin_owner[n] >= 0 && pin_owner[n] != net) { owner_clash++; return false; }
@@ -594,7 +598,7 @@ DrouteResult detailedRoute(const Floorplan& fp, const CellNetlist& nl, const Lef
             if (net < 2) continue;
             Pin pin;
             int lp = c.macro->pinIndex(inst.cell->pins[k].name);
-            if (lp < 0) continue;
+            if (lp < 0) { missingAccess(net); continue; }
             double sx = 0, sy = 0;
             int ns = 0;
             size_t ci = static_cast<size_t>(&c - fp.components.data());
@@ -696,8 +700,7 @@ DrouteResult detailedRoute(const Floorplan& fp, const CellNetlist& nl, const Lef
                 }
             }
             if (pin.terms.empty()) {
-                res.pins_without_access++;
-                missing_pin[net] = 1;
+                missingAccess(net);
                 if (std::getenv("FASTPNR_TRACE")) fprintf(stderr, "no access: %s/%s (%s, orient %s, %zu candidates in the cell)\n", inst.name.c_str(),
                                                           inst.cell->pins[k].name.c_str(), c.macro->name.c_str(), orientName(c.orient), acc ? (*acc)[k].size() : 0);
                 continue;
@@ -709,7 +712,7 @@ DrouteResult detailedRoute(const Floorplan& fp, const CellNetlist& nl, const Lef
         int net = nl.port_bits[p.port_bit].net;
         if (net < 2) continue;
         int l = layerOf(p.layer);
-        if (l < 0) continue;
+        if (l < 0) { missingAccess(net); continue; }
         Rect r{p.x + p.shape.x0, p.y + p.shape.y0, p.x + p.shape.x1, p.y + p.shape.y1};
         Pin pin;
         pin.cx = (r.x0 + r.x1) / 2.0;
@@ -721,7 +724,7 @@ DrouteResult detailedRoute(const Floorplan& fp, const CellNetlist& nl, const Lef
             Node n = G.id(i, j, l);
             if (claim(n, net)) pin.terms.push_back(n);
         }
-        if (pin.terms.empty()) { res.pins_without_access++; missing_pin[net] = 1; continue; }
+        if (pin.terms.empty()) { missingAccess(net); continue; }
         pins_of[net].push_back(std::move(pin));
     }
     if (escapes_failed) res.notes.push_back(std::to_string(escapes_failed) + " macro pins found no free escape row");
@@ -729,7 +732,11 @@ DrouteResult detailedRoute(const Floorplan& fp, const CellNetlist& nl, const Lef
 
     std::vector<RNet> nets;
     for (size_t n = 2; n < pins_of.size(); ++n) {
-        if (pins_of[n].size() < 2) continue;
+        if (pins_of[n].size() < 2) {
+            // A net may have too few accessible terminals precisely because it is open.
+            if (pins_of[n].size() + missing_pins[n] >= 2) ++res.unrouted;
+            continue;
+        }
         RNet r;
         r.netlist_net = static_cast<int>(n);
         r.pins = std::move(pins_of[n]);
@@ -745,15 +752,17 @@ DrouteResult detailedRoute(const Floorplan& fp, const CellNetlist& nl, const Lef
         r.pin_order.push_back(0);
         std::vector<char> taken(r.pins.size(), 0);
         taken[0] = 1;
+        // Only the last addition can lower an unvisited pin's distance to the tree.
+        std::vector<double> nearest(r.pins.size(), 1e300);
         for (size_t k = 1; k < r.pins.size(); ++k) {
+            const Pin& last = r.pins[r.pin_order.back()];
             int best = -1;
             double bd = 1e300;
             for (size_t q = 0; q < r.pins.size(); ++q) {
                 if (taken[q]) continue;
-                for (int o : r.pin_order) {
-                    double d = std::fabs(r.pins[q].cx - r.pins[o].cx) + std::fabs(r.pins[q].cy - r.pins[o].cy);
-                    if (d < bd) { bd = d; best = static_cast<int>(q); }
-                }
+                double d = std::fabs(r.pins[q].cx - last.cx) + std::fabs(r.pins[q].cy - last.cy);
+                nearest[q] = std::min(nearest[q], d);
+                if (nearest[q] < bd) { bd = nearest[q]; best = static_cast<int>(q); }
             }
             taken[best] = 1;
             r.pin_order.push_back(best);
@@ -842,8 +851,14 @@ DrouteResult detailedRoute(const Floorplan& fp, const CellNetlist& nl, const Lef
     };
 
     const int n_threads = std::max(1, opt.threads);
-    std::vector<SearchCtx> ctxs(static_cast<size_t>(n_threads));
-    for (auto& ctx : ctxs) ctx.init(N, static_cast<size_t>(ggx) * ggy, static_cast<size_t>(ggx) * ggy * G.nl);
+    std::vector<SearchCtx> ctxs;
+    auto ensureWorkers = [&](int count) {
+        while (static_cast<int>(ctxs.size()) < count) {
+            ctxs.emplace_back();
+            ctxs.back().init(N, static_cast<size_t>(ggx) * ggy, static_cast<size_t>(ggx) * ggy * G.nl);
+        }
+    };
+    ensureWorkers(1);
 
     const bool trace_search = std::getenv("FASTPNR_TRACE_SEARCH") != nullptr;
     double pres = 1.0;
@@ -1123,8 +1138,10 @@ DrouteResult detailedRoute(const Floorplan& fp, const CellNetlist& nl, const Lef
                 continue;
             }
             int workers = std::min<int>(n_threads, static_cast<int>(w.size()));
+            ensureWorkers(workers);
             std::atomic<size_t> next_idx{0};
-            std::vector<std::vector<int>> deferred(static_cast<size_t>(workers));
+            // Retry in wave order, independently of which worker finished first.
+            std::vector<char> deferred(w.size(), 0);
             std::vector<std::thread> pool;
             pool.reserve(static_cast<size_t>(workers));
             for (int t = 0; t < workers; ++t) {
@@ -1134,14 +1151,14 @@ DrouteResult detailedRoute(const Floorplan& fp, const CellNetlist& nl, const Lef
                         if (idx >= w.size()) break;
                         int id = w[idx].id;
                         if (!routeNet(ctxs[t], id, margin, false)) {
-                            deferred[t].push_back(id);
+                            deferred[idx] = 1;
                         }
                     }
                 });
             }
             for (auto& th : pool) th.join();
-            for (const auto& dv : deferred) {
-                for (int id : dv) routeNet(ctxs[0], id, margin, true);
+            for (size_t idx = 0; idx < w.size(); ++idx) {
+                if (deferred[idx]) routeNet(ctxs[0], w[idx].id, margin, true);
             }
         }
         for (int id : serial_only) routeNet(ctxs[0], id, margin, true);
@@ -1550,7 +1567,7 @@ DrouteResult detailedRoute(const Floorplan& fp, const CellNetlist& nl, const Lef
             if (root == kNone) root = r;
             else if (find(r) != find(root)) { connected = false; break; }
         }
-        if ((!connected || missing_pin[net.netlist_net]) && net.ok) res.unrouted++;
+        if ((!connected || missing_pins[net.netlist_net]) && net.ok) res.unrouted++;
         if (trace && !net.ok) {
             for (const Pin& p : net.pins) {
                 Node t = p.terms[0];
@@ -1560,9 +1577,9 @@ DrouteResult detailedRoute(const Floorplan& fp, const CellNetlist& nl, const Lef
                         below == kNone ? -1 : blocked[below], below == kNone ? -9 : pin_owner[below]);
             }
         }
-        if (trace && (!connected || missing_pin[net.netlist_net] || !net.ok))
+        if (trace && (!connected || missing_pins[net.netlist_net] || !net.ok))
             fprintf(stderr, "dr bad net %s: %zu pins, routed=%d connected=%d missing_pin=%d\n", nl.net_names[net.netlist_net].c_str(), net.pins.size(), net.ok,
-                    connected, missing_pin[net.netlist_net]);
+                    connected, missing_pins[net.netlist_net]);
         res.nets.push_back(std::move(out));
     }
     res.conflicts = conflicts(nullptr);
