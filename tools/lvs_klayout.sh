@@ -44,9 +44,16 @@ def section(name):
 comps = re.findall(r'-\s+(\S+)\s+(\S+)', section('COMPONENTS'))
 conn = {}   # (instance, pin) -> net
 ports = []
+pins_on = {}   # net -> the top-level pins on it
 for stmt in section('PINS').split(';'):
     m = re.search(r'-\s+(\S+)\s+\+\s+NET\s+(\S+)', stmt)
-    if m and m.group(1) not in ('VDD', 'VSS'): ports.append(m.group(2))
+    if m and m.group(1) not in ('VDD', 'VSS'):
+        ports.append(m.group(2))
+        pins_on.setdefault(m.group(2), []).append(m.group(1))
+# A net with several top-level pins (an input wired straight to an output, `assign y = a`):
+# the extracted layout names it after all its labels, sorted and joined by commas, so the
+# schematic does the same (LVS then still checks that those pins share one net)
+alias = {n: ','.join(sorted(p)) for n, p in pins_on.items() if len(p) > 1}
 for stmt in section('NETS').split(';'):
     m = re.match(r'\s*-\s+(\S+)', stmt)
     if not m: continue
@@ -54,7 +61,7 @@ for stmt in section('NETS').split(';'):
     for inst, pin in re.findall(r'\(\s*(\S+)\s+(\S+)\s*\)', stmt.split('+')[0]):
         if inst != 'PIN': conn[(inst, pin)] = net
 unc = 0
-def spice(n): return n.replace('\\', '')
+def spice(n): return alias.get(n, n).replace('\\', '')
 with open(out_path, 'w') as f:
     # KLayout's SPICE reader stops a path at '-': the CDLs are copied next to the schematic
     for path in cdls: f.write('.INCLUDE %s\n' % path.split('/')[-1])
