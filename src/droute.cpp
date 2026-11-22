@@ -1100,10 +1100,19 @@ DrouteResult detailedRoute(const Floorplan& fp, const CellNetlist& nl, const Lef
         return true;
     };
 
-    // Route a list of nets: serially when n_threads == 1, or in disjoint spatial waves when n_threads > 1
-    auto routeBatch = [&](const std::vector<int>& batch, int margin) {
+    // Route a list of nets: serially when n_threads == 1, or in disjoint spatial waves when n_threads > 1.
+    // With `ripup`, each net's old route is removed as late as possible: just before that net is rerouted
+    // (serially), or just before its wave starts (in parallel). Nets still waiting keep their old routes,
+    // whose cost steers the nets routed before them: that is the negotiation. Ripping every net up first
+    // lets the first nets take the freed tracks and the later ones collide (the delay ALU then no longer
+    // converges).
+    auto routeBatch = [&](const std::vector<int>& batch, int margin, bool ripup) {
+        auto serial = [&](int id) {
+            if (ripup) ripUp(nets[id]);
+            routeNet(ctxs[0], id, margin, true);
+        };
         if (n_threads <= 1 || batch.size() < 4) {
-            for (int id : batch) routeNet(ctxs[0], id, margin, true);
+            for (int id : batch) serial(id);
             return;
         }
         int mi = std::max(1, static_cast<int>(margin * gr.gcell / sx));
@@ -1134,9 +1143,12 @@ DrouteResult detailedRoute(const Floorplan& fp, const CellNetlist& nl, const Lef
         }
         for (const auto& w : waves) {
             if (w.size() < 4) {
-                for (const Box& b : w) routeNet(ctxs[0], b.id, margin, true);
+                for (const Box& b : w) serial(b.id);
                 continue;
             }
+            // the wave's nets have disjoint boxes, so removing their old routes together is harmless;
+            // done here, on this thread, before any worker starts
+            if (ripup) for (const Box& b : w) ripUp(nets[b.id]);
             int workers = std::min<int>(n_threads, static_cast<int>(w.size()));
             ensureWorkers(workers);
             std::atomic<size_t> next_idx{0};
@@ -1161,7 +1173,7 @@ DrouteResult detailedRoute(const Floorplan& fp, const CellNetlist& nl, const Lef
                 if (deferred[idx]) routeNet(ctxs[0], w[idx].id, margin, true);
             }
         }
-        for (int id : serial_only) routeNet(ctxs[0], id, margin, true);
+        for (int id : serial_only) serial(id);
     };
 
     std::vector<int> order(nets.size());
@@ -1170,7 +1182,7 @@ DrouteResult detailedRoute(const Floorplan& fp, const CellNetlist& nl, const Lef
         long ha = (nets[a].gx1 - nets[a].gx0) + (nets[a].gy1 - nets[a].gy0), hb = (nets[b].gx1 - nets[b].gx0) + (nets[b].gy1 - nets[b].gy0);
         return ha != hb ? ha < hb : a < b;
     });
-    routeBatch(order, 1);
+    routeBatch(order, 1, false);
 
     // Conflicts: a node used by two nets, or two nets on adjacent nodes of one track
     std::vector<char> pad(N, 0);
@@ -1188,13 +1200,15 @@ DrouteResult detailedRoute(const Floorplan& fp, const CellNetlist& nl, const Lef
     }
     std::vector<char> multi(N, 0);
     std::vector<int> pown(nl.netCount() > 0 ? N : 0, -1);
+    long shorts = 0;   // nodes used by two nets (metal on metal), counted by the last conflicts() call
     auto conflicts = [&](std::vector<char>* bad_net) {
+        shorts = 0;
         std::fill(who.begin(), who.end(), -1);
         std::fill(multi.begin(), multi.end(), 0);
         for (size_t id = 0; id < nets.size(); ++id) {
             for (Node n : nets[id].used) {
                 if (who[n] == -1) who[n] = static_cast<int>(id);
-                else if (who[n] != static_cast<int>(id)) multi[n] = 1;
+                else if (who[n] != static_cast<int>(id)) { shorts += !multi[n]; multi[n] = 1; }
             }
         }
         long count = 0;
@@ -1290,12 +1304,8 @@ DrouteResult detailedRoute(const Floorplan& fp, const CellNetlist& nl, const Lef
             }
         }
         victim_list.clear();
-        for (int id : order) {
-            if (!bad[id]) continue;
-            ripUp(nets[id]);
-            victim_list.push_back(id);
-        }
-        routeBatch(victim_list, 1 + it / 4);
+        for (int id : order) if (bad[id]) victim_list.push_back(id);
+        routeBatch(victim_list, 1 + it / 4, true);
         long c = conflicts(nullptr);
         if (trace) {
             auto [ss, sf, sp] = sumStats();
@@ -1306,6 +1316,7 @@ DrouteResult detailedRoute(const Floorplan& fp, const CellNetlist& nl, const Lef
         else { if (c < best) best = c; if (++stall >= opt.patience) break; }
     }
     res.conflicts = conflicts(nullptr);
+    res.shorts = shorts;
     res.ms_route = msSince(t1);
 
     // ------------------------------------------------ finishing: gaps, minimum area, output
@@ -1583,6 +1594,7 @@ DrouteResult detailedRoute(const Floorplan& fp, const CellNetlist& nl, const Lef
         res.nets.push_back(std::move(out));
     }
     res.conflicts = conflicts(nullptr);
+    res.shorts = shorts;
     if (trace) {
         for (size_t id = 0; id < nets.size(); ++id) {
             for (Node n : nets[id].used) {

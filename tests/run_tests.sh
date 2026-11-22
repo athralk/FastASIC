@@ -238,6 +238,20 @@ if [ -f "$PDK_LIB" ] && [ -x "$PNR" ]; then
     done
     check "mul16.v: multithreaded -j 4 detailed routing + SPEF export + lsta -spef" 0 "Fmax" \
         bash -c "'$PNR' -q -droute -j 4 -o '$FP_TMP/mul16_mt.def' -spef '$FP_TMP/mul16_mt.spef' '$DIR/../bench/sta/netlists/mul16.v' && '$LSTA' -q -corner slow -sdc '$DIR/../bench/sta/default.sdc' -spef '$FP_TMP/mul16_mt.spef' '$DIR/../bench/sta/netlists/mul16.v'"
+    for d in add64 mul16; do
+        check "$d.v: detailed routing on 4 threads, no conflicts or opens" 0 "0 conflicts, 0 unconnected nets, 0 pins without access" \
+            "$PNR" -droute -j 4 -o "$FP_TMP/$d.mt.routed.def" "$DIR/../bench/sta/netlists/$d.v"
+    done
+    # A congested design that needs many rip-up rounds: it stops converging when the rip-up order is
+    # wrong (all victims removed before any is rerouted), which the small designs above do not show.
+    # About 4 minutes, so only with FASTASIC_SLOW=1.
+    if [ "${FASTASIC_SLOW:-0}" = 1 ]; then
+        "$BIN" -q --map delay --equiv-method sim -o "$FP_TMP/alu_delay.cells.v" "$DIR/../bench/flow/alu.v" > /dev/null 2>&1
+        for j in 1 16; do
+            check "64-bit ALU (delay mapping): detailed routing on $j thread(s), no conflicts or opens" 0 "0 conflicts, 0 unconnected nets, 0 pins without access" \
+                "$PNR" -droute -j $j -o "$FP_TMP/alu_delay.j$j.def" "$FP_TMP/alu_delay.cells.v"
+        done
+    fi
     if [ "${FASTASIC_SIGNOFF:-0}" = 1 ]; then
         for d in acc16 sram_buffer fifo_2p; do
             check "$d: IHP KLayout DRC deck, 0 violations" 0 "DRC violations (excluding metal density): 0" bash "$DIR/../tools/drc_klayout.sh" "$FP_TMP/$d.routed.def"
