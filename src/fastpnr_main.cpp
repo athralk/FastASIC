@@ -186,7 +186,7 @@ int main(int argc, char* argv[]) {
             if (const char* v = std::getenv("FASTPNR_WRONG_WAY")) dopt.wrong_way = std::atof(v);
             if (const char* v = std::getenv("FASTPNR_THREADS")) dopt.threads = std::max(1, std::atoi(v));
             dr = detailedRoute(fp, netlist, lef, gr, dopt);
-            if (dr.conflicts) problems.push_back(std::to_string(dr.conflicts) + " detailed-routing conflicts left (shorts or spacing)");
+            if (dr.conflicts) problems.push_back(std::to_string(dr.conflicts) + " detailed-routing conflicts left (" + std::to_string(dr.shorts) + " shorts, the rest spacing)");
             if (dr.unrouted) problems.push_back(std::to_string(dr.unrouted) + " nets not fully connected");
         }
         auto t3d = std::chrono::steady_clock::now();
@@ -250,6 +250,7 @@ int main(int argc, char* argv[]) {
                           << dr.pins_without_access << " pins without access, min-area fixes " << dr.min_area_fixes << " (" << dr.min_area_left << " left)\n"
                           << std::setprecision(1) << "            time " << ms(t3c, t3d) << " ms (setup " << dr.ms_setup << ", route " << dr.ms_route << ", finish "
                           << dr.ms_finish << ")\n";
+                if (dr.conflicts) std::cout << "Note        " << dr.shorts << " of the " << dr.conflicts << " conflicts are shorts (two nets on one node; DRC cannot see them)\n";
                 for (const auto& n : dr.notes) std::cout << "Note        " << n << "\n";
             }
             std::cout << std::setprecision(1) << "Time        " << ms(t0, t4) << " ms (LEF " << ms(t0, t1) << ", netlist " << ms(t1, t2) << ", floorplan "

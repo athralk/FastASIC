@@ -210,7 +210,7 @@ docker run --rm --user "$(id -u):$(id -g)" -e HOME=/w -v "$TMP:/w" -v "$PDK_DIR:
   python3 /pdk/ihp-sg13cmos5l/libs.tech/klayout/tech/lvs/run_lvs.py --layout=/w/out.gds --netlist=/w/top.cdl --run_dir=/w/run \
     --topcell=$TOP --run_mode=deep --disable_tap_extraction > /w/lvs.log 2>&1;
   if [ -f /w/probe.py ]; then klayout -b -r /w/probe.py > /w/probe.log 2>&1; fi" || true
-[ -n "${LVS_KEEP:-}" ] && cp -r "$TMP"/lvs.log "$TMP"/top.cdl "$TMP"/run "$TMP"/out.gds "$TMP"/probes.json "$TMP"/probe.py "$TMP"/probe.log "$TMP"/convert.log "$LVS_KEEP"/ 2>/dev/null
+[ -n "${LVS_KEEP:-}" ] && cp -r "$TMP"/lvs.log "$TMP"/top.cdl "$TMP"/run "$TMP"/out.gds "$TMP"/probes.json "$TMP"/probe.py "$TMP"/probe.log "$TMP"/convert.log "$LVS_KEEP"/ 2>/dev/null || true   # some files exist only with SRAMs
 status=0
 if [ -n "$SRAMS" ]; then
     if grep -q 'opens 0, shorts 0' "$TMP/probe.log" 2>/dev/null; then grep 'SRAM pins probed' "$TMP/probe.log"

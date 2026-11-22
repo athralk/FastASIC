@@ -54,6 +54,7 @@ struct DrouteResult {
     std::vector<int> wire_layer;    // the LEF layer of each grid layer
     int iterations = 0;
     long conflicts = 0;             // nodes shared, or adjacent on a track, by different nets
+    long shorts = 0;                // of those: nodes used by two nets (metal touching, which DRC cannot see)
     int unrouted = 0;               // nets with a pin that could not be reached
     int pins_without_access = 0;
     int min_area_fixes = 0, min_area_left = 0;
