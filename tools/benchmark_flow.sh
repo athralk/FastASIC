@@ -2,7 +2,7 @@
 # Full-flow benchmark of one Verilog design: FastASIC against Yosys + ABC and OpenROAD.
 #
 #   synthesis   FastASIC vs Yosys + ABC (time, cells, area)
-#   routing     fastpnr (1 thread) vs OpenROAD FastRoute + TritonRoute (all threads), on the
+#   routing     fastpnr vs OpenROAD FastRoute + TritonRoute, on the
 #               same netlist and placement (fastpnr's), so only the routers differ
 #   quality     IHP KLayout DRC on both layouts, IHP KLayout LVS on fastpnr's, wire, vias
 #   timing      both routed layouts extracted with OpenRCX (IHP rules) and timed with OpenSTA,
@@ -15,13 +15,15 @@
 #   --name NAME         output folder runs/NAME (default: file name, plus _delay for --map delay)
 #   --equiv sat|sim     FastASIC's built-in equivalence check (default sim: random simulation;
 #                       sat proves it, but cannot finish on large multipliers)
+#   --threads N         the same N threads for fastpnr's detailed routing (-j N) and OpenROAD
+#                       (default: fastpnr 1 thread, OpenROAD all threads)
 # Everything is kept in runs/NAME/. OpenROAD's routing (the slow part) is reused when the netlist
 # and placement are unchanged; delete runs/NAME/openroad.* to force a new run.
 # Needs docker with the OpenLane 2 image, yosys and the IHP PDK.
 set -euo pipefail
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
-RTL=""; MAP=area; PERIOD=10; TOP=""; NAME=""; EQUIV=sim
+RTL=""; MAP=area; PERIOD=10; TOP=""; NAME=""; EQUIV=sim; BOTH_THREADS=""
 while [ $# -gt 0 ]; do
     case $1 in
         --map) MAP=$2; shift 2 ;;
@@ -29,6 +31,7 @@ while [ $# -gt 0 ]; do
         --top) TOP=$2; shift 2 ;;
         --name) NAME=$2; shift 2 ;;
         --equiv) EQUIV=$2; shift 2 ;;
+        --threads) BOTH_THREADS=$2; shift 2 ;;
         -*) echo "unknown option $1"; exit 2 ;;
         *) RTL=$(realpath "$1"); shift ;;
     esac
@@ -50,7 +53,8 @@ mkdir -p "$OUT"
 cp "$RTL" "$OUT/$base.v"
 IMAGE=${OPENLANE_IMAGE:-ghcr.io/efabless/openlane2:2.3.10}
 PDK_DIR=${PDK_ROOT:-$HOME/ttsetup/pdk}
-THREADS=${OPENROAD_THREADS:-$(nproc)}
+THREADS=${BOTH_THREADS:-${OPENROAD_THREADS:-$(nproc)}}
+FA_THREADS=${BOTH_THREADS:-${FASTPNR_THREADS:-1}}
 ms() { python3 -c "import sys; print(round(float(sys.argv[1]) * 1000))" "$1"; }
 log() { echo "[$(date +%H:%M:%S)] $*" >&2; }
 
@@ -71,7 +75,7 @@ read -r yo_cells yo_area < <("$ROOT/lsta" -q "$OUT/yosys.cells.v" 2>&1 | grep -o
 log "place and route: fastpnr"
 "$ROOT/fastpnr" -q -no-route -o "$OUT/placed.new.def" "$OUT/fastasic.cells.v"
 [ -s "$OUT/placed.new.def" ] || { echo "fastpnr did not write the placement (runs/$NAME/placed.new.def)"; exit 1; }
-"$ROOT/fastpnr" -droute -o "$OUT/fastasic.routed.def" "$OUT/fastasic.cells.v" > "$OUT/fastpnr.log" 2>&1 || true
+"$ROOT/fastpnr" -droute -j "$FA_THREADS" -o "$OUT/fastasic.routed.def" "$OUT/fastasic.cells.v" > "$OUT/fastpnr.log" 2>&1 || true
 fa_gr=$(grep -oE 'routing [0-9.]+ \[capacity' "$OUT/fastpnr.log" | awk '{print $2}')
 fa_dr=$(grep -oE 'time [0-9.]+ ms \(setup' "$OUT/fastpnr.log" | awk '{print $2}')
 fa_wire=$(grep -oE '[0-9]+ um of wire' "$OUT/fastpnr.log" | awk '{print $1}')
@@ -79,7 +83,7 @@ fa_vias=$(grep -oE '[0-9]+ vias, [0-9]+ negotiation' "$OUT/fastpnr.log" | awk '{
 fa_state=$(grep -oE '[0-9]+ conflicts, [0-9]+ unconnected nets' "$OUT/fastpnr.log")
 
 # ---------------------------------------------------------------- routing: OpenROAD (cached)
-if [ -f "$OUT/placed.def" ] && cmp -s "$OUT/placed.def" "$OUT/placed.new.def" && [ -f "$OUT/openroad.routed.def" ] && [ -f "$OUT/openroad.times" ]; then
+if [ -f "$OUT/placed.def" ] && cmp -s "$OUT/placed.def" "$OUT/placed.new.def" && [ -f "$OUT/openroad.routed.def" ] && [ -f "$OUT/openroad.times" ] && [ "$(awk '{print $5}' "$OUT/openroad.times")" = "$THREADS" ]; then
     log "routing: OpenROAD (reusing the earlier run on this placement)"
 else
     mv "$OUT/placed.new.def" "$OUT/placed.def"
@@ -136,7 +140,7 @@ d = dict(name="$NAME", map="$MAP", period=float("$PERIOD"),
          fa_area=float("$fa_area"), yo_area=float("$yo_area"),
          fa_gr=float("${fa_gr:-0}"), fa_dr=float("${fa_dr:-0}"), or_gr=float("$or_gr"), or_dr=float("$or_dr"),
          fa_wire=float("${fa_wire:-0}"), or_wire=float("$or_wire"), fa_vias=int("${fa_vias:-0}"), or_vias=int("$or_vias"),
-         fa_drc="$fa_drc", or_drc="$or_drc", fa_lvs="$fa_lvs", state="$fa_state", threads="$or_threads",
+         fa_drc="$fa_drc", or_drc="$or_drc", fa_lvs="$fa_lvs", state="$fa_state", threads="$or_threads", fa_threads=int("$FA_THREADS"),
          fa_typ=float("$fa_typ"), fa_slow=float("$fa_slow"), or_typ=float("$or_typ"), or_slow=float("$or_slow"))
 s = lambda ms: f"{ms / 1000:.1f} s" if ms >= 1000 else f"{ms:.0f} ms"
 pct = lambda a, b: f"{(a / b - 1) * 100:+.1f}%"
@@ -149,7 +153,7 @@ lines = [
     f"  Routing (global+detail) {s(fa_route):<21} OpenROAD: {s(or_route):<22} {or_route / fa_route:.1f}x",
     f"    global                {s(d['fa_gr']):<21} FastRoute: {s(d['or_gr']):<21} {d['or_gr'] / max(d['fa_gr'], 1e-3):.1f}x",
     f"    detailed              {s(d['fa_dr']):<21} TritonRoute: {s(d['or_dr']):<19} {d['or_dr'] / max(d['fa_dr'], 1e-3):.1f}x",
-    f"  (fastpnr 1 thread, OpenROAD {d['threads']} threads)",
+    f"  (fastpnr {d['fa_threads']} thread{'s' if d['fa_threads'] > 1 else ''}, OpenROAD {d['threads']} threads)",
     "",
     "Result                    FastASIC              Yosys / OpenROAD                 FastASIC vs",
     f"  Cells                   {d['fa_cells']:<21} {d['yo_cells']:<32} {pct(d['fa_cells'], d['yo_cells'])}",
