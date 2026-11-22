@@ -11,7 +11,7 @@ bench/sta/netlists/mul16.v    default.sdc    slow    -                          
 bench/sta/netlists/mac32.v    default.sdc    typ     -                            | -5454.65    213.25     -121089.09
 bench/sta/netlists/mac32.v    default.sdc    slow    -                            | -10510.42   381.98     -288471.65
 bench/sta/netlists/add64.v    virtual.sdc    fast    -                            | -1767.55    1052.33    -23912.81
-bench/sta/netlists/mul16.v    propagated.sdc typ     -cts:sg13cmos5l_buf_8:6      | -547.25     318.98     -1961.92
+bench/sta/netlists/mul16.v    propagated.sdc typ     -cts:sg13cmos5l_buf_8:6      | -539.10     323.29     -1967.37
 # with IHP SRAM macros (netlists from our own --map): WNS / TNS agree exactly; single endpoints at
 # macro pins can differ by tens of ps because OpenSTA 2.6.0 compounds the slew conversion between
 # libraries over the loads of a net (see README), which lsta does not

@@ -16,6 +16,7 @@
 #include "../include/tech_mapper.hpp"
 #include "../include/cut_mapper.hpp"
 #include "../include/balance.hpp"
+#include "../include/clock_tree.hpp"
 #include "../include/timer.hpp"
 #include <algorithm>
 #include <cstdlib>
@@ -200,9 +201,14 @@ void printForest(const std::string& title, const std::string& rootLabel, const G
 enum class EquivMethod {
     SAT,    // SAT proof (default): a proof for any input count, and faster than simulation here
     SIM,    // simulation: exhaustive up to 20 inputs, 65,536 random patterns above (not a proof)
+    NONE,   // skip internal equivalence check (fast inner-loop exploration mode)
 };
 
 bool reportEquivalence(const std::string& label, const GateForest& a, const GateForest& b, EquivMethod method) {
+    if (method == EquivMethod::NONE) {
+        std::cout << "  " << label << ": SKIPPED (--equiv-method none)\n";
+        return true;
+    }
     std::cout << "  " << label << ": ";
     if (method == EquivMethod::SAT) {
         CecResult result = proveEquivalence(a, b);
@@ -277,9 +283,10 @@ int usage(const char* program) {
               << "  --macro-lib FILE      Liberty file of a hard macro (SRAM); PDK SRAMs (RM_IHPSG13_*) are found by name\n"
               << "  --no-sram-infer       keep reg memories as flip-flops (default: big ones become PDK SRAM macros)\n"
               << "  -o FILE               write the optimized NAND + INV netlist as structural Verilog\n"
-              << "  --equiv-method sat|sim  sat: SAT proof (default); sim: bit-parallel simulation, exhaustive up to\n"
-              << "                        20 inputs, 65,536 random patterns above (a sample, not a proof)\n"
+              << "  --equiv-method sat|sim|none  sat: SAT proof (default); sim: simulation, exhaustive up to\n"
+              << "                        20 inputs, sampled above; none: skip internal checks during synthesis\n"
               << "  --map area|delay      map onto real sg13cmos5l cells by tree covering (-o then writes cells)\n"
+              << "  --buffer-nets | --no-buffer   enable or disable buffering (enabled by --map delay)\n"
               << "  --mapper cut|tree     cut: cut enumeration + Boolean matching (default); tree: tree covering\n"
               << "  --adder STYLE         ripple | brent-kung | sklansky | kogge-stone for +, -, comparisons and\n"
               << "                        multipliers (default ripple; sklansky with --map delay)\n"
@@ -318,6 +325,7 @@ int main(int argc, char* argv[]) {
     TimingConstraints constraints;
     std::string netlistPath, libPath, sdcPath;
     bool mapCells = false, nldm = false, treeMapper = false;
+    bool noBufferNets = false, forceBufferNets = false;
     MapGoal mapGoal = MapGoal::AREA;
     std::vector<std::string> files;
 
@@ -366,8 +374,11 @@ int main(int argc, char* argv[]) {
                 std::string name = argv[++i];
                 if (name == "sim") equivMethod = EquivMethod::SIM;
                 else if (name == "sat") equivMethod = EquivMethod::SAT;
+                else if (name == "none") equivMethod = EquivMethod::NONE;
                 else return usage(argv[0]);
             }
+            else if (arg == "--no-buffer") noBufferNets = true;
+            else if (arg == "--buffer-nets") forceBufferNets = true;
             else if (arg == "--delay-model" && hasValue) {
                 std::string name = argv[++i];
                 if (name == "rc") delayModel = DelayModel::RC;
@@ -393,6 +404,9 @@ int main(int argc, char* argv[]) {
         if (files.size() != (equivMode ? 2u : 1u)) return usage(argv[0]);
         if (!adderChosen && mapCells && mapGoal == MapGoal::DELAY) adderStyle = AdderStyle::SKLANSKY;
 
+        if (equivMode && equivMethod == EquivMethod::NONE) {
+            throw std::runtime_error("--equiv requires sat or sim");
+        }
         if (equivMode) {
             Design first = parseFile(files[0]);
             Design second = parseFile(files[1]);
@@ -452,6 +466,43 @@ int main(int argc, char* argv[]) {
             MapResult mapped = treeMapper ? mapToCells(design, optimizedForest, lib, mapGoal)
                                           : mapByCuts(design, optimizedForest, lib, mapGoal);
             cellNetlist = std::move(mapped.netlist);
+            if (!noBufferNets && (forceBufferNets || mapGoal == MapGoal::DELAY)) {
+                std::set<std::string> clk_ports;
+                for (const auto& r : design.registers) {
+                    if (!r.clock.empty()) clk_ports.insert(r.clock);
+                }
+                // Include macro clocks (and clock-only designs) when the pin is driven by a port.
+                std::set<int> clock_nets;
+                for (const auto& inst : cellNetlist.instances) {
+                    for (size_t k = 0; k < inst.pin_net.size(); ++k) {
+                        if (inst.pin_net[k] >= 2 && inst.cell->pins[k].is_clock) clock_nets.insert(inst.pin_net[k]);
+                    }
+                }
+                for (const auto& pb : cellNetlist.port_bits) {
+                    if (pb.is_input && clock_nets.count(pb.net)) clk_ports.insert(pb.name);
+                }
+                size_t original_instances = cellNetlist.instances.size();
+                // Buffer data first so this pass never subdivides the new clock-tree branches.
+                BufferNetsReport bnr = bufferHighFanoutNets(cellNetlist, lib, 16, "sg13cmos5l_buf_4", clk_ports);
+                int cts_bufs = 0;
+                ClockTreeOptions cto;
+                cto.max_fanout = 24;
+                if (lib.find(cto.buffer)) {
+                    for (const auto& clock : clk_ports) {
+                        cts_bufs += insertClockTree(cellNetlist, lib, clock, cto).buffers;
+                    }
+                }
+                int hold_bufs = repairFastHoldPaths(cellNetlist, lib, 2, 24);
+                for (size_t i = original_instances; i < cellNetlist.instances.size(); ++i) {
+                    ++mapped.cell_counts[cellNetlist.instances[i].cell->name];
+                }
+                mapped.area = cellNetlist.area();
+                if (cts_bufs > 0 || bnr.buffers_added > 0 || hold_bufs > 0) {
+                    std::cout << "\n=== Net Buffering & Hold Repair ===\n"
+                              << "Clock tree buffers: " << cts_bufs << ", high-fanout nets buffered: " << bnr.buffered_nets
+                              << " (+" << bnr.buffers_added << " buffers), hold buffers: " << hold_bufs << "\n";
+                }
+            }
             std::cout << "\n=== Technology Mapping (" << lib.name << ", " << (mapGoal == MapGoal::AREA ? "area" : "delay") << ") ===\n";
             int total = 0;
             std::string breakdown;
@@ -463,7 +514,10 @@ int main(int argc, char* argv[]) {
             std::ostringstream area;
             area << std::fixed << std::setprecision(2) << mapped.area;
             std::cout << "Area: " << area.str() << " um^2\n";
-            cellsOk = reportEquivalence("original vs cells", forest, cellNetlistToForest(cellNetlist), equivMethod);
+            // Reconstructing a Boolean forest is only needed for an equivalence check.
+            GateForest cellForest;
+            if (equivMethod != EquivMethod::NONE) cellForest = cellNetlistToForest(cellNetlist);
+            cellsOk = reportEquivalence("original vs cells", forest, cellForest, equivMethod);
         }
 
         if (!netlistPath.empty()) {
