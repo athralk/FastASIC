@@ -15,7 +15,8 @@ NetlistBuilder::NetlistBuilder(const Design& design, const Library& lib, const s
             if (p.is_input) {
                 int net = nl.addNet(name);
                 input_net_[name] = net;
-                nl.port_bits.push_back({name, true, net});
+                nl.port_bits.push_back({name, true, net, p.is_vector});
+                if (p.is_vector) nl.vector_nets.insert(net);
             }
         }
     }
@@ -51,11 +52,19 @@ int NetlistBuilder::invert(int net) {
 }
 
 void NetlistBuilder::finish(const std::vector<std::pair<std::string, int>>& root_nets) {
+    std::unordered_set<std::string> output_buses;
+    for (const auto& port : nl.ports)
+        if (!port.is_input && port.is_vector) output_buses.insert(port.name);
     std::unordered_map<std::string, int> next_net, macro_net;
     for (const auto& [name, net] : root_nets) {
         if (isMacroInputName(name)) macro_net[name] = net;
         else if (isNextStateName(name)) next_net[name.substr(0, name.size() - 5)] = net;
-        else nl.port_bits.push_back({name, false, net});
+        else {
+            size_t subscript = name.rfind('[');
+            bool bus_bit = subscript != std::string::npos && output_buses.count(name.substr(0, subscript));
+            nl.port_bits.push_back({name, false, net, bus_bit});
+            if (bus_bit && nl.net_names.at(net) == name) nl.vector_nets.insert(net);
+        }
     }
     for (const auto& m : design_.macros) {
         const LibCell* cell = lib_.find(m.cell);

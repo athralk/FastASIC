@@ -177,7 +177,9 @@ class NetlistParser {
         int width = std::abs(msb - lsb) + 1;
         for (int k = 0; k < width; ++k) {
             int bit = msb >= lsb ? lsb + k : lsb - k;
-            s.nets.push_back(newNet(is_vector ? name + "[" + std::to_string(bit) + "]" : name));
+            int net = newNet(is_vector ? name + "[" + std::to_string(bit) + "]" : name);
+            if (is_vector) nl.vector_nets.insert(net);
+            s.nets.push_back(net);
         }
         return signals[name] = s;
     }
@@ -366,31 +368,34 @@ public:
             int width = static_cast<int>(s.nets.size());
             for (int k = 0; k < width; ++k) {
                 int bit = s.msb >= s.lsb ? s.lsb + k : s.lsb - k;
-                nl.port_bits.push_back({s.is_vector ? port.name + "[" + std::to_string(bit) + "]" : port.name, port.is_input, s.nets[k]});
+                nl.port_bits.push_back({s.is_vector ? port.name + "[" + std::to_string(bit) + "]" : port.name, port.is_input, s.nets[k], s.is_vector});
             }
         }
         // Representative names: constants, then input ports, then output ports, then the rest
-        std::vector<std::string> rep_name(nl.net_names.size());
+        std::vector<int> representative(nl.netCount());
         std::vector<int> rank(nl.net_names.size(), 4);
-        auto offer = [&](int net, const std::string& name, int r) {
+        auto offer = [&](int net, int r) {
             int root = find(net);
             if (r < rank[root]) {
                 rank[root] = r;
-                rep_name[root] = name;
+                representative[root] = net;
             }
         };
-        offer(CellNetlist::kConst0, "1'b0", 0);
-        offer(CellNetlist::kConst1, "1'b1", 0);
-        for (const auto& pb : nl.port_bits) offer(pb.net, pb.name, pb.is_input ? 1 : 2);
-        for (size_t n = 2; n < nl.net_names.size(); ++n) offer(static_cast<int>(n), nl.net_names[n], 3);
+        offer(CellNetlist::kConst0, 0);
+        offer(CellNetlist::kConst1, 0);
+        for (const auto& pb : nl.port_bits) offer(pb.net, pb.is_input ? 1 : 2);
+        for (size_t n = 2; n < nl.net_names.size(); ++n) offer(static_cast<int>(n), 3);
 
         std::vector<int> new_index(nl.net_names.size(), -1);
         std::vector<std::string> names;
+        std::unordered_set<int> vector_nets;
         for (size_t n = 0; n < nl.net_names.size(); ++n) {
             int root = find(static_cast<int>(n));
             if (new_index[root] < 0) {
                 new_index[root] = static_cast<int>(names.size());
-                names.push_back(rep_name[root]);
+                int rep = representative[root];
+                if (nl.vector_nets.count(rep)) vector_nets.insert(new_index[root]);
+                names.push_back(nl.net_names[rep]);
             }
         }
         auto remap = [&](int net) { return net < 0 ? -1 : new_index[find(net)]; };
@@ -399,6 +404,7 @@ public:
             for (int& n : inst.pin_net) n = remap(n);
         }
         nl.net_names = std::move(names);
+        nl.vector_nets = std::move(vector_nets);
         if (new_index[find(0)] != 0 || new_index[find(1)] != 1) error("constant 0 and 1 were tied together");
         return std::move(nl);
     }

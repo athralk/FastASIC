@@ -8,7 +8,7 @@
 //
 // Supported: create_clock, set_clock_uncertainty, set_clock_transition, set_clock_latency,
 // set_propagated_clock, set_input_delay, set_output_delay, set_load, set_driving_cell,
-// set_input_transition; object queries get_ports, get_clocks, all_inputs [-no_clocks],
+// set_input_transition, global set_timing_derate; object queries get_ports, get_clocks, all_inputs [-no_clocks],
 // all_outputs, all_clocks; Tcl `set` variables with $name substitution and [expr ...].
 // Object lists are kept as name patterns (glob * ?) and matched against the netlist later.
 
@@ -40,7 +40,23 @@ struct SdcDrivingCell {
     std::string cell, pin, from_pin;
 };
 
+enum class DerateType { Cell, Net, Check };
+
+struct TimingDerates {
+    // [type][clock path][falling transition][late analysis]
+    double factors[3][2][2][2];
+    TimingDerates() {
+        for (auto& type : factors)
+            for (auto& path : type)
+                for (auto& edge : path) edge[0] = edge[1] = 1;
+    }
+    double get(DerateType type, bool clock_path, bool fall, bool late) const {
+        return factors[static_cast<int>(type)][clock_path][fall][late];
+    }
+};
+
 struct Sdc {
+    TimingDerates derates;
     std::vector<SdcClock> clocks;
     std::vector<SdcPortDelay> input_delays, output_delays;
     std::vector<SdcPortValue> loads, input_transitions;

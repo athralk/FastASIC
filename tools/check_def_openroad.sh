@@ -30,8 +30,15 @@ puts "FPCHECK read_def ok: [llength [[ord::get_db_block] getInsts]] instances, [
 global_placement -density $DENSITY -skip_io
 detailed_placement
 if {[catch {check_placement -verbose} err]} { puts "FPCHECK check_placement FAILED: \$err" } else { puts "FPCHECK check_placement ok" }
-foreach net {VDD VSS} {
+set supply_types {}
+foreach supply [[ord::get_db_block] getNets] {
+    if {[\$supply getSigType] ni {POWER GROUND}} continue
+    lappend supply_types [\$supply getSigType]
+    set net [\$supply getName]
     if {[catch {check_power_grid -net \$net} err]} { puts "FPCHECK check_power_grid \$net FAILED: \$err" } else { puts "FPCHECK check_power_grid \$net ok" }
+}
+foreach type {POWER GROUND} {
+    if {\$type ni \$supply_types} { puts "FPCHECK check_power_grid FAILED: missing \$type net" }
 }
 set_routing_layers -signal Metal2-Metal4
 if {[catch {global_route -allow_congestion} err]} { puts "FPCHECK global_route FAILED: \$err" } else { puts "FPCHECK global_route ok" }

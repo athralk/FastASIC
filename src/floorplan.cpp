@@ -109,6 +109,89 @@ std::vector<TrackSpec> readTracksFile(const std::string& path) {
     return out;
 }
 
+// The digital TT template has one unrotated rectangular port per signal, with an
+// empty special net for each supply. Reject other pin formats rather than moving them.
+void readTileInterface(const std::string& path, Floorplan& fp, const CellNetlist& nl, const Lef& lef) {
+    std::ifstream in(path);
+    if (!in) throw std::runtime_error("cannot open tile template " + path);
+    auto expect = [&](const std::string& want) {
+        std::string got;
+        if (!(in >> got) || got != want)
+            throw std::runtime_error(path + ": expected " + want + ", got " + got);
+    };
+    auto point = [&]() {
+        Dbu x, y;
+        expect("(");
+        if (!(in >> x >> y)) throw std::runtime_error(path + ": malformed coordinates");
+        expect(")");
+        return std::make_pair(x, y);
+    };
+    std::map<std::string, int> bits;
+    for (size_t i = 0; i < nl.port_bits.size(); ++i) bits.emplace(nl.port_bits[i].name, i);
+    bool units = false, supplies[2] = {};
+    std::string key;
+    while (in >> key) {
+        if (key == "UNITS") {
+            expect("DISTANCE"); expect("MICRONS"); expect(std::to_string(lef.dbu)); expect(";");
+            units = true;
+        } else if (key == "DIEAREA") {
+            auto [x0, y0] = point();
+            auto [x1, y1] = point();
+            expect(";");
+            if (x0 || y0 || x1 <= 0 || y1 <= 0) throw std::runtime_error(path + ": unsupported die outline");
+            fp.die = {x0, y0, x1, y1};
+        } else if (key == "PINS") {
+            expect(std::to_string(bits.size())); expect(";");
+            while (!bits.empty()) {
+                std::string name, layer, placement;
+                expect("-"); in >> name;
+                auto bit = bits.find(name);
+                if (bit == bits.end()) throw std::runtime_error(path + ": unexpected pin " + name);
+                FpPin p;
+                p.port_bit = bit->second;
+                expect("+"); expect("NET"); expect(name); expect("+"); expect("DIRECTION");
+                expect(nl.port_bits[p.port_bit].is_input ? "INPUT" : "OUTPUT");
+                expect("+"); expect("USE"); expect("SIGNAL"); expect("+"); expect("PORT");
+                expect("+"); expect("LAYER"); in >> layer;
+                p.layer = lef.layerIndex(layer);
+                if (p.layer < 0) throw std::runtime_error(path + ": unknown pin layer " + layer);
+                auto [x0, y0] = point();
+                auto [x1, y1] = point();
+                if (x1 <= x0 || y1 <= y0) throw std::runtime_error(path + ": empty pin " + name);
+                p.shape = {x0, y0, x1, y1};
+                expect("+"); in >> placement;
+                if (placement != "PLACED" && placement != "FIXED") throw std::runtime_error(path + ": unplaced pin " + name);
+                std::tie(p.x, p.y) = point();
+                expect("N"); expect(";");
+                if (p.y + y1 == fp.die.y1) p.side = 'T';
+                else if (p.y + y0 == fp.die.y0) p.side = 'B';
+                else if (p.x + x1 == fp.die.x1) p.side = 'R';
+                else if (p.x + x0 == fp.die.x0) p.side = 'L';
+                else throw std::runtime_error(path + ": expected a tile-edge pin for " + name);
+                fp.pins.push_back(p);
+                bits.erase(bit);
+            }
+            expect("END"); expect("PINS");
+        } else if (key == "SPECIALNETS") {
+            expect("2"); expect(";");
+            for (int k = 0; k < 2; ++k) {
+                std::string name, use;
+                expect("-"); in >> name; expect("+"); expect("USE"); in >> use; expect(";");
+                int net = use == "POWER" ? 0 : 1;
+                if ((use != "POWER" && use != "GROUND") || supplies[net]) throw std::runtime_error(path + ": invalid supplies");
+                fp.supplies[net] = name;
+                supplies[net] = true;
+            }
+            expect("END"); expect("SPECIALNETS");
+        } else {
+            std::string rest;
+            std::getline(in, rest);
+        }
+    }
+    if (!units || !bits.empty() || !supplies[0] || !supplies[1] || fp.supplies[0] == fp.supplies[1] || fp.die.width() <= 0)
+        throw std::runtime_error(path + ": incomplete tile interface");
+}
+
 } // namespace
 
 int insertTieCells(CellNetlist& nl, const Library& lib, const std::string& tie_lo, const std::string& tie_hi) {
@@ -153,6 +236,9 @@ Floorplan buildFloorplan(const CellNetlist& nl, const Lef& lef, const FloorplanO
     if (!fp.site) throw std::runtime_error("site " + opt.site + " is not in the LEF");
     const Dbu sw = fp.site->width, sh = fp.site->height, grid = lef.manufacturing_grid;
     auto um = [&](double v) { return lef.toDbu(v); };
+
+    fp.tt_tile = !opt.tt_template.empty();
+    if (fp.tt_tile) readTileInterface(opt.tt_template, fp, nl, lef);
 
     // Components and areas
     std::vector<int> macro_instances;
@@ -207,8 +293,10 @@ Floorplan buildFloorplan(const CellNetlist& nl, const Lef& lef, const FloorplanO
     };
 
     Dbu core_w, core_h;
-    if (opt.die_width > 0 && opt.die_height > 0) {
-        fp.die = {0, 0, roundDown(um(opt.die_width), grid), roundDown(um(opt.die_height), grid)};
+    if (fp.tt_tile || (opt.die_width > 0 && opt.die_height > 0)) {
+        if (!fp.tt_tile) fp.die = {0, 0, roundDown(um(opt.die_width), grid), roundDown(um(opt.die_height), grid)};
+        else if ((opt.die_width && um(opt.die_width) != fp.die.width()) || (opt.die_height && um(opt.die_height) != fp.die.height()))
+            throw std::runtime_error("requested die size differs from tile template");
         fp.core.x0 = roundUp(margin, sw);
         fp.core.y0 = roundUp(margin, ygrid);
         core_w = roundDown(fp.die.x1 - margin - fp.core.x0, sw);
@@ -321,7 +409,7 @@ Floorplan buildFloorplan(const CellNetlist& nl, const Lef& lef, const FloorplanO
 
     // I/O pins on the die edge: inputs on the left and bottom, outputs on the right and top,
     // each on a routing track of the edge's pin layer, spread evenly
-    {
+    if (!fp.tt_tile) {
         int hl = lef.layerIndex(opt.pin_hlayer), vl = lef.layerIndex(opt.pin_vlayer);
         if (hl < 0 || vl < 0) throw std::runtime_error("pin layers " + opt.pin_hlayer + "/" + opt.pin_vlayer + " are not in the LEF");
         auto slots = [&](int layer, bool x_tracks, Dbu lo, Dbu hi) {
@@ -391,9 +479,12 @@ Floorplan buildFloorplan(const CellNetlist& nl, const Lef& lef, const FloorplanO
 
     // Power grid: Metal1 rails along every row boundary, vertical straps, horizontal top straps,
     // via stacks where the same net crosses, and top-strap vias onto the macros' own power pins
+    if (fp.tt_tile && !macro_instances.empty())
+        throw std::runtime_error("the Metal4 tile grid does not support macro power pins yet");
     if (opt.pdn) {
-        int rl = lef.layerIndex(opt.rail_layer), sl = lef.layerIndex(opt.strap_layer), tl = lef.layerIndex(opt.top_layer);
-        if (rl < 0 || sl < 0 || tl < 0 || !(rl < sl && sl < tl)) {
+        int rl = lef.layerIndex(opt.rail_layer), sl = lef.layerIndex(opt.strap_layer), tl = fp.tt_tile ? sl : lef.layerIndex(opt.top_layer);
+        if (rl < 0 || sl < 0 || tl < 0 || !(rl < sl && (fp.tt_tile || sl < tl))) {
+            if (fp.tt_tile) throw std::runtime_error("the Metal4 tile power grid requires the Metal1 and Metal4 routing layers");
             fp.notes.push_back("power grid skipped: layers " + opt.rail_layer + " < " + opt.strap_layer + " < " + opt.top_layer + " not found in the LEF");
         } else {
             const Dbu rw = roundUp(um(opt.rail_width), 2 * grid), stw = roundUp(um(opt.strap_width), 2 * grid), tw = roundUp(um(opt.top_width), 2 * grid);
@@ -423,6 +514,7 @@ Floorplan buildFloorplan(const CellNetlist& nl, const Lef& lef, const FloorplanO
             for (const auto& row : SL.table) for (Dbu v : row) strap_gap = std::max(strap_gap, v);
             const Dbu top_gap = std::max(TL.spacing, grid);
             Dbu pitch = std::min(um(opt.strap_pitch), core_w);
+            if (pitch <= 0) throw std::runtime_error("power strap pitch must be positive");
             struct Strap { int net; Dbu c; Interval span; };
             std::vector<Strap> straps;
             auto freeSpans = [&](Dbu c) {
@@ -430,7 +522,13 @@ Floorplan buildFloorplan(const CellNetlist& nl, const Lef& lef, const FloorplanO
                 for (const Rect& b : fp.macro_blockages) {
                     if (b.x0 < c + stw / 2 && c - stw / 2 < b.x1) blocked.push_back({b.y0, b.y1});
                 }
-                return subtract(fp.core.y0 - rw / 2, fp.core.y1 + rw / 2, blocked);
+                // TT supply ports must reach within 10 um of both die edges.
+                Dbu lo = fp.core.y0 - rw / 2, hi = fp.core.y1 + rw / 2;
+                if (fp.tt_tile) {
+                    lo = std::min(lo, um(5.0));
+                    hi = std::max(hi, fp.die.y1 - um(5.0));
+                }
+                return subtract(lo, hi, blocked);
             };
             for (Dbu base = fp.core.x0 + pitch / 4; base < fp.core.x1; base += pitch) {
                 for (int net = 0; net < 2; ++net) {
@@ -480,9 +578,10 @@ Floorplan buildFloorplan(const CellNetlist& nl, const Lef& lef, const FloorplanO
             }
             // Horizontal top straps across the whole core (over the macros too)
             Dbu tpitch = std::min(um(opt.top_pitch), core_h);
+            if (!fp.tt_tile && tpitch <= 0) throw std::runtime_error("top strap pitch must be positive");
             struct Top { int net; Dbu c; };
             std::vector<Top> tops;
-            for (Dbu base = fp.core.y0 + tpitch / 4; base < fp.core.y1; base += tpitch) {
+            for (Dbu base = fp.core.y0 + tpitch / 4; !fp.tt_tile && base < fp.core.y1; base += tpitch) {
                 for (int net = 0; net < 2; ++net) {
                     Dbu c = roundDown(base + net * (tpitch / 2), grid);
                     if (c - tw / 2 < fp.core.y0 || c + tw / 2 > fp.core.y1) continue;
@@ -491,7 +590,7 @@ Floorplan buildFloorplan(const CellNetlist& nl, const Lef& lef, const FloorplanO
             }
             // Repair: a strap segment no top strap crosses (a short one under a macro) gets one
             int floating = 0;
-            for (const Strap& s : straps) {
+            if (!fp.tt_tile) for (const Strap& s : straps) {
                 bool reached = false;
                 for (const Top& t : tops) reached |= t.net == s.net && t.c - tw / 2 >= s.span.lo && t.c + tw / 2 <= s.span.hi;
                 if (reached) continue;
@@ -591,6 +690,7 @@ Floorplan buildFloorplan(const CellNetlist& nl, const Lef& lef, const FloorplanO
                     }
                 }
             }
+            if (fp.tt_tile && (missing || unpowered || straps.empty())) throw std::runtime_error("incomplete Metal4 tile power grid");
             if (missing) fp.notes.push_back(std::to_string(missing) + " power-grid crossings too small for a via");
             if (!macro_instances.empty() && macro_vias == 0) fp.notes.push_back("no top strap reaches a macro power pin; lower --top-pitch");
         }

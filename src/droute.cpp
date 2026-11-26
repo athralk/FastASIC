@@ -191,12 +191,6 @@ DrouteResult detailedRoute(const Floorplan& fp, const CellNetlist& nl, const Lef
     }
     std::sort(G.xs.begin(), G.xs.end()); G.xs.erase(std::unique(G.xs.begin(), G.xs.end()), G.xs.end());
     std::sort(G.ys.begin(), G.ys.end()); G.ys.erase(std::unique(G.ys.begin(), G.ys.end()), G.ys.end());
-    G.nx = static_cast<int>(G.xs.size());
-    G.ny = static_cast<int>(G.ys.size());
-    if (G.nx < 2 || G.ny < 2) throw std::runtime_error("no routing tracks");
-    if (G.size() >= kNone) throw std::runtime_error("design too large for the detailed-routing grid");
-    const size_t N = G.size();
-
     // Vias between consecutive grid layers
     std::vector<ViaPick> via(G.nl);
     for (int l = 0; l + 1 < G.nl; ++l) {
@@ -222,6 +216,30 @@ DrouteResult detailedRoute(const Floorplan& fp, const CellNetlist& nl, const Lef
         res.wire_width[l] = w;
         res.wire_layer[l] = G.lef[l];
     }
+    // A track on the outline is legal in DEF, but a centred via or wire end on
+    // that track can extend outside the die. Keep the whole footprint inside.
+    Dbu margin_x = 0, margin_y = 0;
+    auto includePad = [&](const Rect& r) {
+        margin_x = std::max({margin_x, -r.x0, r.x1});
+        margin_y = std::max({margin_y, -r.y0, r.y1});
+    };
+    for (const ViaPick& v : via) { includePad(v.bottom); includePad(v.top); }
+    if (have_via1v) { includePad(via1v.bottom); includePad(via1v.top); }
+    for (Dbu w : res.wire_width) {
+        margin_x = std::max(margin_x, (w + 1) / 2);
+        margin_y = std::max(margin_y, (w + 1) / 2);
+    }
+    auto trim = [](std::vector<Dbu>& tracks, Dbu lo, Dbu hi) {
+        tracks.erase(std::remove_if(tracks.begin(), tracks.end(), [&](Dbu t) { return t < lo || t > hi; }), tracks.end());
+    };
+    trim(G.xs, fp.die.x0 + margin_x, fp.die.x1 - margin_x);
+    trim(G.ys, fp.die.y0 + margin_y, fp.die.y1 - margin_y);
+    G.nx = static_cast<int>(G.xs.size());
+    G.ny = static_cast<int>(G.ys.size());
+    if (G.nx < 2 || G.ny < 2) throw std::runtime_error("no routing tracks");
+    if (G.size() >= kNone) throw std::runtime_error("design too large for the detailed-routing grid");
+    const size_t N = G.size();
+
     // ------------------------------------------------ obstacles
     // blocked: no net may use the node; pin_owner: only that net may (its pin)
     std::vector<char> blocked(N, 0);

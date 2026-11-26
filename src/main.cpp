@@ -23,6 +23,7 @@
 #include <dirent.h>
 #include <map>
 #include <fstream>
+#include <filesystem>
 #include <iomanip>
 #include <iostream>
 #include <memory>
@@ -448,6 +449,26 @@ int main(int argc, char* argv[]) {
         if (nldm && runSta) mapCells = true;
         CellNetlist cellNetlist;
         Library lib;
+        auto mappingConstraints = [&]() -> Sdc {
+            if (!sdcPath.empty()) {
+                return readSdc(sdcPath, lib.time_unit_ps, lib.cap_unit_ff);
+            } else {
+                // A real clock on the registers' clock port, or a virtual one for combinational designs
+                std::ostringstream text;
+                std::string inputs = "[all_inputs]";
+                text << "create_clock -name vclk -period " << constraints.clock_period_ps / lib.time_unit_ps;   // "vclk": virtual unless bound to a port below
+                if (!design.registers.empty()) {
+                    text << " [get_ports {" << design.registers[0].clock << "}]";
+                    inputs = "[all_inputs -no_clocks]";
+                }
+                text << "\n"
+                     << "set_input_delay " << constraints.input_delay_ps / lib.time_unit_ps << " -clock vclk " << inputs << "\n"
+                     << "set_output_delay " << constraints.output_delay_ps / lib.time_unit_ps << " -clock vclk [all_outputs]\n"
+                     << "set_load " << constraints.output_load_ff / lib.cap_unit_ff << " [all_outputs]\n";
+                if (lib.find("sg13cmos5l_buf_4")) text << "set_driving_cell -lib_cell sg13cmos5l_buf_4 -pin X " << inputs << "\n";
+                return parseSdc(text.str(), lib.time_unit_ps, lib.cap_unit_ff);
+            }
+        };
         if (mapCells) {
             if (libPath.empty()) {
                 const char* root = std::getenv("PDK_ROOT");
@@ -492,7 +513,26 @@ int main(int argc, char* argv[]) {
                         cts_bufs += insertClockTree(cellNetlist, lib, clock, cto).buffers;
                     }
                 }
-                int hold_bufs = repairFastHoldPaths(cellNetlist, lib, 2, 24);
+                int hold_bufs = 0;
+                const auto path = std::filesystem::path(libPath);
+                const auto prefix = path.parent_path() / "sg13cmos5l_stdcell_";
+                const auto fast = prefix.string() + "fast_1p32V_m40C.lib";
+                const auto slow = prefix.string() + "slow_1p08V_125C.lib";
+                if (clk_ports.size() == 1 && design.macros.empty() &&
+                    path.filename().string().find("sg13cmos5l_stdcell_") == 0 &&
+                    std::filesystem::exists(fast) && std::filesystem::exists(slow)) {
+                    auto sdc = mappingConstraints();
+                    if (sdc.clocks.size() == 1 && sdc.clocks[0].sources == std::vector<std::string>{*clk_ports.begin()}) {
+                        sdc.clocks[0].propagated = true;
+                        const auto report = repairFastHoldPaths(cellNetlist, lib, readLiberty(fast), readLiberty(slow), sdc);
+                        hold_bufs = report.buffers;
+                        if (report.remaining_data_endpoints)
+                            std::cout << "Hold repair: " << report.remaining_data_endpoints
+                                      << " register data endpoints still violate fast hold\n";
+                    } else std::cout << "Skipping hold repair: clock constraint does not match design clock\n";
+                } else if (!clk_ports.empty()) {
+                    std::cout << "Skipping hold repair: requires a single clock and characterized IHP standard cells\n";
+                }
                 for (size_t i = original_instances; i < cellNetlist.instances.size(); ++i) {
                     ++mapped.cell_counts[cellNetlist.instances[i].cell->name];
                 }
@@ -529,25 +569,7 @@ int main(int argc, char* argv[]) {
         }
 
         if (runSta && nldm) {
-            Sdc sdc;
-            if (!sdcPath.empty()) {
-                sdc = readSdc(sdcPath, lib.time_unit_ps, lib.cap_unit_ff);
-            } else {
-                // A real clock on the registers' clock port, or a virtual one for combinational designs
-                std::ostringstream text;
-                std::string inputs = "[all_inputs]";
-                text << "create_clock -name vclk -period " << constraints.clock_period_ps / lib.time_unit_ps;   // "vclk": virtual unless bound to a port below
-                if (!design.registers.empty()) {
-                    text << " [get_ports {" << design.registers[0].clock << "}]";
-                    inputs = "[all_inputs -no_clocks]";
-                }
-                text << "\n"
-                     << "set_input_delay " << constraints.input_delay_ps / lib.time_unit_ps << " -clock vclk " << inputs << "\n"
-                     << "set_output_delay " << constraints.output_delay_ps / lib.time_unit_ps << " -clock vclk [all_outputs]\n"
-                     << "set_load " << constraints.output_load_ff / lib.cap_unit_ff << " [all_outputs]\n";
-                if (lib.find("sg13cmos5l_buf_4")) text << "set_driving_cell -lib_cell sg13cmos5l_buf_4 -pin X " << inputs << "\n";
-                sdc = parseSdc(text.str(), lib.time_unit_ps, lib.cap_unit_ff);
-            }
+            Sdc sdc = mappingConstraints();
             std::cout << "\n=== Static Timing Analysis (NLDM, " << lib.name << ") ===\n";
             printTimingResult(std::cout, analyzeNetlistTiming(cellNetlist, lib, sdc));
         } else if (runSta) {

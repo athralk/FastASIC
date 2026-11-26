@@ -34,7 +34,12 @@ BufferNetsReport bufferHighFanoutNets(CellNetlist& netlist, const Library& lib, 
                                       const std::string& buffer_cell = "sg13cmos5l_buf_4",
                                       const std::set<std::string>& skip_ports = {"clk", "clock", "CLK"});
 
-// Inserts a delay buffer in front of flip-flop D inputs that have short (<= max_short_hops)
-// register-to-register feedback/shift paths and shallow max logic depth (<= max_setup_hops),
-// preventing fast-corner hold violations without hurting critical setup paths.
-int repairFastHoldPaths(CellNetlist& netlist, const Library& lib, int max_short_hops = 2, int max_setup_hops = 8);
+struct Sdc;
+struct HoldRepairReport {
+    int buffers = 0;
+    int remaining_data_endpoints = 0;
+};
+
+// Select violating register inputs at the fast corner and validate each change at both corners.
+HoldRepairReport repairFastHoldPaths(CellNetlist& netlist, const Library& lib, const Library& fast, const Library& slow,
+                        const Sdc& constraints);

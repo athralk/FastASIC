@@ -27,6 +27,7 @@ int usage() {
               << "  -util U          standard-cell utilization, 0..1 (default 0.5)\n"
               << "  -aspect A        core height / width (default 1)\n"
               << "  -die W H         fixed die size in um (overrides -util)\n"
+              << "  -tt-template DEF use an IHP Tiny Tapeout digital tile interface and Metal4 power stripes\n"
               << "  -margin UM       die edge to core distance (default 10)\n"
               << "  -halo UM         free space around each macro (default 10)\n"
               << "  -tracks FILE     tracks.info (default: LibreLane's for sg13cmos5l)\n"
@@ -87,6 +88,7 @@ int main(int argc, char* argv[]) {
                 opt.die_height = std::stod(argv[++i]);
             } else if (a == "-margin" && v) opt.core_margin = std::stod(argv[++i]);
             else if (a == "-halo" && v) opt.macro_halo = std::stod(argv[++i]);
+            else if (a == "-tt-template" && v) opt.tt_template = argv[++i];
             else if (a == "-tracks" && v) opt.tracks_file = argv[++i];
             else if (a == "-strap-pitch" && v) opt.strap_pitch = std::stod(argv[++i]);
             else if (a == "-top-pitch" && v) opt.top_pitch = std::stod(argv[++i]);
@@ -144,6 +146,8 @@ int main(int argc, char* argv[]) {
         Lef lef;
         for (const auto& f : lefs) readLef(f, lef);
         for (const auto& w : lef.warnings) std::cerr << "LEF warning: " << w << "\n";
+        if (!opt.tt_template.empty() && (!opt.pdn || lef.layerIndex(gopt.max_layer) > lef.layerIndex("Metal4")))
+            throw std::runtime_error("Tiny Tapeout requires a power grid and routing at or below Metal4");
         Library lib = libraryFromLef(lef);
         auto t1 = std::chrono::steady_clock::now();
 

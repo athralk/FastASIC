@@ -37,6 +37,7 @@ All coordinates are integers in database units (1 nm for IHP). Cut layers withou
 
 1. **Tie cells.** Pins tied to a constant (`1'b0` / `1'b1`) get a `tielo` / `tiehi` cell each, as OpenROAD's `insert_tiecells` does. DEF has no constants.
 2. **Size.** The core area is the cell area divided by the utilization (default 50%), plus each macro with its halo. The core is snapped to the 0.48 µm site grid and to whole 3.78 µm rows. Its origin sits on the Metal1 track grid, so the rows line up with the tracks. `-die W H` fixes the size instead.
+   For an IHP Tiny Tapeout digital standard-cell tile, pass `-tt-template path/to/tt_block_3x2_pgvdd.def`. The template supplies the die outline, fixed signal pin rectangles and supply names. Both supplies use near-full-height Metal4 ports over the vertical stripes, with via stacks down to the Metal1 row rails. The tile mode supports standard cells. The default grid also supports SRAM macros.
 3. **Macros (SRAMs).**
    - They are packed left to right from the top of the core, in N orientation, so their pins (on the bottom edge) face the logic.
    - A 20 µm column of rows is always kept beside them, so the power grid can run past the macros.

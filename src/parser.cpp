@@ -549,7 +549,8 @@ ExprPtr VerilogParser::parseNumber(const Token& token) {
         is_signed = true;   // a plain decimal number is a (signed) integer
     }
 
-    std::vector<bool> bits, wild;   // least significant bit first
+    std::vector<LiteralDigit> wild;
+    std::vector<bool> bits;   // least significant bit first
     if (base == 'd') {
         for (char c : digits) {
             char lc = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
@@ -575,19 +576,19 @@ ExprPtr VerilogParser::parseNumber(const Token& token) {
             if (v >= (1 << bits_per_digit)) errorAt(token, "invalid digit '" + std::string(1, *it) + "' in '" + token.value + "'");
             for (int k = 0; k < bits_per_digit; ++k) {
                 bits.push_back((v >> k) & 1);
-                wild.push_back(w);
+                wild.push_back(c == 'x' ? LiteralDigit::X : w ? LiteralDigit::Z : LiteralDigit::Known);
             }
         }
     }
 
     // Sized literals are truncated or extended to their size (with x/z if the leftmost digit is
     // one); unsized ones are at least 32 bits
-    bool wild_top = !wild.empty() && wild.back();
+    auto wild_top = wild.empty() ? LiteralDigit::Known : wild.back();
     size_t width = size > 0 ? static_cast<size_t>(size) : std::max<size_t>(32, bits.size());
     bits.resize(width, false);
     wild.resize(width, wild_top);
     bool any_wild = false;
-    for (bool w : wild) any_wild |= w;
+    for (auto digit : wild) any_wild |= digit != LiteralDigit::Known;
 
     auto node = makeExpr(ExprKind::NUMBER, token);
     node->bits = std::move(bits);

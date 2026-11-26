@@ -99,15 +99,15 @@ class Elaborator {
     Shared& sh;
     std::string prefix;                               // "u_core.u_alu." for an instance, "" at the top
     bool is_top;
-    std::unordered_map<std::string, long long> param_values;   // parameter values given by the instance
+    using Overrides = std::unordered_map<std::string, std::function<ExprPtr(long long)>>;
+    Overrides param_values;   // parameter values given by the instance
     std::unordered_set<const GateNode*> input_bits;          // this module's input port bits
     std::unordered_map<const Stmt*, std::pair<size_t, bool>> sram_access;   // stmt -> pending SRAM, is write
     NodePtr path_cond;                                       // condition under which the current statement runs
-    std::unordered_map<std::string, long long> params;
+    std::unordered_map<std::string, ExprPtr> params;
     std::unordered_map<std::string, Signal> signals;
     std::vector<std::string> signal_order;
     std::unordered_set<std::string> integers;   // only usable as for-loop variables
-    std::unordered_set<std::string> unsigned_params;   // parameters with a range (others are signed integers)
     std::unordered_map<std::string, const FunctionDecl*> functions;
     int call_depth = 0;
     int generate_count = 0;
@@ -350,8 +350,7 @@ class Elaborator {
             if (j < 0) return constant(false);
             return j < static_cast<long long>(la) ? a[j] : a[la - 1];
         };
-        unsigned long long correction = 0;   // the constant row, mod 2^width
-        unsigned long long mask = width >= 64 ? ~0ULL : ((1ULL << width) - 1);
+        std::vector<bool> inverted_sign(width, false);
         long long rows = (static_cast<long long>(lb) + 1) / 2;
         for (long long i = 0; i < rows; ++i) {
             NodePtr y2 = yb(2 * i + 1), y1 = yb(2 * i), y0 = yb(2 * i - 1);
@@ -367,11 +366,13 @@ class Elaborator {
             }
             place(base, neg);   // + 1 completes the two's complement of a negative digit
             // inverting the sign bit adds 2^(base + la): subtract it again in the constant row
-            if (base + static_cast<long long>(la) < 64) correction -= 1ULL << (base + la);
+            if (base + static_cast<long long>(la) < width) inverted_sign[base + la] = true;
         }
-        correction &= mask;
-        for (long long c = 0; c < width && c < 64; ++c) {
-            if ((correction >> c) & 1) place(c, constant(true));
+        // Two's complement of the inverted sign columns at the full product width.
+        bool lowest_one_seen = false;
+        for (long long c = 0; c < width; ++c) {
+            if (inverted_sign[c] != lowest_one_seen) place(c, constant(true));
+            lowest_one_seen |= inverted_sign[c];
         }
         // Constant ones in a column: fold pairs into the next column (no adders needed)
         for (long long c = 0; c < width; ++c) {
@@ -484,6 +485,8 @@ class Elaborator {
         case ExprKind::UNARY:
         case ExprKind::BINARY:
         case ExprKind::TERNARY:
+        case ExprKind::CONCAT:
+        case ExprKind::REPLICATE:
             return std::all_of(e.operands.begin(), e.operands.end(), [&](const ExprPtr& op) { return isConstant(*op); });
         case ExprKind::CALL:
             return (e.name == "$clog2" || e.name == "$signed" || e.name == "$unsigned") && e.operands.size() == 1 &&
@@ -493,76 +496,34 @@ class Elaborator {
         }
     }
 
-    long long requireConst(const Expr& e, const std::string& message) const {
+    long long requireConst(const Expr& e, const std::string& message) {
         if (!isConstant(e)) errorAt(e.line, message);
         return evalConst(e);
     }
 
-    long long evalConst(const Expr& e) const {
-        switch (e.kind) {
-        case ExprKind::NUMBER: {
-            if (!e.wild.empty()) errorAt(e.line, "x/z/? digits are only allowed in casez / casex labels");
-            long long v = 0;
-            for (size_t i = 0; i < e.bits.size(); ++i) {
-                if (!e.bits[i]) continue;
-                if (i >= 63) errorAt(e.line, "constant is too large to use here");
-                v |= 1LL << i;
-            }
-            if (e.is_signed && e.bits.size() < 64 && !e.bits.empty() && e.bits.back()) v -= 1LL << e.bits.size();   // negative
-            return v;
+    long long evalConst(const Expr& e) {
+        // Convert to a host index only at API boundaries that require one.
+        Bits v = evaluateSelf(e);
+        bool negative = isSigned(e) && isConst(v.back(), true);
+        long long value = negative ? -1 : 0;
+        for (size_t i = 0; i < v.size(); ++i) {
+            if (isConst(v[i], negative)) continue;
+            if (i >= 63) errorAt(e.line, "constant is too large to use here");
+            value ^= 1LL << i;
         }
-        case ExprKind::IDENTIFIER:
-            return params.at(e.name);
-        case ExprKind::UNARY: {
-            long long v = evalConst(*e.operands[0]);
-            if (e.op == "-") return -v;
-            if (e.op == "+") return v;
-            if (e.op == "~") return ~v;
-            if (e.op == "!") return !v;
-            errorAt(e.line, "operator '" + e.op + "' is not supported in constant expressions");
-        }
-        case ExprKind::BINARY: {
-            long long a = evalConst(*e.operands[0]);
-            long long b = evalConst(*e.operands[1]);
-            const std::string& op = e.op;
-            if (op == "+") return a + b;
-            if (op == "-") return a - b;
-            if (op == "*") return a * b;
-            if (op == "/" || op == "%") {
-                if (b == 0) errorAt(e.line, "division by zero in constant expression");
-                return op == "/" ? a / b : a % b;
-            }
-            if (op == "<<" || op == "<<<") return (b < 0 || b > 63) ? 0 : static_cast<long long>(static_cast<unsigned long long>(a) << b);
-            if (op == ">>") return (b < 0 || b > 63) ? 0 : static_cast<long long>(static_cast<unsigned long long>(a) >> b);
-            if (op == ">>>") return (b < 0 || b > 63) ? (a < 0 ? -1 : 0) : a >> b;
-            if (op == "&") return a & b;
-            if (op == "|") return a | b;
-            if (op == "^") return a ^ b;
-            if (op == "~^") return ~(a ^ b);
-            if (op == "==") return a == b;
-            if (op == "!=") return a != b;
-            if (op == "<") return a < b;
-            if (op == "<=") return a <= b;
-            if (op == ">") return a > b;
-            if (op == ">=") return a >= b;
-            if (op == "&&") return a && b;
-            if (op == "||") return a || b;
-            errorAt(e.line, "operator '" + op + "' is not supported in constant expressions");
-        }
-        case ExprKind::TERNARY:
-            return evalConst(*e.operands[0]) ? evalConst(*e.operands[1]) : evalConst(*e.operands[2]);
-        case ExprKind::CALL: {
-            long long v = evalConst(*e.operands[0]);
-            if (e.name == "$clog2") {
-                long long bits = 0;
-                while (bits < 63 && (1LL << bits) < v) bits++;
-                return bits;
-            }
-            return v;   // $signed / $unsigned of a constant
-        }
-        default:
-            errorAt(e.line, "expected a constant expression");
-        }
+        return value;
+    }
+
+    ExprPtr constantLiteral(const Expr& e, long long declared_width = 0) {
+        if (!isConstant(e)) errorAt(e.line, "parameter value must be a constant expression");
+        auto lit = std::make_shared<Expr>();
+        lit->kind = ExprKind::NUMBER;
+        lit->line = e.line;
+        lit->is_signed = !declared_width && isSigned(e);
+        Bits v = evaluate(e, std::max(declared_width, selfWidth(e)));
+        v.resize(declared_width ? declared_width : v.size());
+        for (const auto& bit : v) lit->bits.push_back(isConst(bit, true));
+        return lit;
     }
 
     // ---------- Signals and widths ----------
@@ -580,9 +541,9 @@ class Elaborator {
         return width;
     }
 
-    long long replicationCount(const Expr& e) const {
+    long long replicationCount(const Expr& e) {
         long long count = requireConst(*e.operands[0], "replication count must be a constant");
-        if (count < 1) errorAt(e.line, "replication count must be positive");
+        if (count < 0) errorAt(e.line, "replication count must be nonnegative");
         return count;
     }
 
@@ -611,7 +572,7 @@ class Elaborator {
     }
 
     // Positions (within one word) of a constant bit / part select
-    std::pair<long long, long long> staticRange(const Expr& e, const Signal& sig) const {
+    std::pair<long long, long long> staticRange(const Expr& e, const Signal& sig) {
         auto position = [&](long long index) {
             long long p = sig.position(index);
             if (p < 0) {
@@ -637,7 +598,7 @@ class Elaborator {
     }
 
     // Width of a select, without building anything
-    long long selectWidth(const Expr& e) const {
+    long long selectWidth(const Expr& e) {
         const Signal& sig = lookupSignal(e.name, e.line);
         if (sig.is_memory && !e.word) {
             if (e.kind != ExprKind::BIT_SELECT) errorAt(e.line, "select a word of memory '" + e.name + "' first: " + e.name + "[i]");
@@ -724,10 +685,10 @@ class Elaborator {
     }
 
     // Self-determined width (Verilog 2005 table 5-22)
-    long long selfWidth(const Expr& e) const {
+    long long selfWidth(const Expr& e) {
         switch (e.kind) {
         case ExprKind::IDENTIFIER: {
-            if (params.count(e.name)) return 32;
+            if (params.count(e.name)) return params.at(e.name)->bits.size();
             const Signal& sig = lookupSignal(e.name, e.line);
             if (sig.is_memory) errorAt(e.line, "memory '" + e.name + "' must be indexed: " + e.name + "[i]");
             return static_cast<long long>(sig.bits.size());
@@ -744,11 +705,20 @@ class Elaborator {
             return std::max(selfWidth(*e.operands[1]), selfWidth(*e.operands[2]));
         case ExprKind::CONCAT: {
             long long total = 0;
-            for (const auto& op : e.operands) total += selfWidth(*op);
+            for (const auto& op : e.operands) {
+                if (op->kind == ExprKind::REPLICATE && replicationCount(*op) == 0) {
+                    selfWidth(*op->operands[1]);
+                    continue;
+                }
+                total += selfWidth(*op);
+            }
             return checkedWidth(total, e.line);
         }
-        case ExprKind::REPLICATE:
-            return checkedWidth(replicationCount(e) * selfWidth(*e.operands[1]), e.line);
+        case ExprKind::REPLICATE: {
+            long long inner = selfWidth(*e.operands[1]), count = replicationCount(e);
+            if (count > kMaxWidth / inner) errorAt(e.line, "replication exceeds maximum width");
+            return checkedWidth(count * inner, e.line);
+        }
         case ExprKind::CALL:
             if (e.name == "$signed" || e.name == "$unsigned") return selfWidth(*e.operands.at(0));
             if (e.name == "$clog2") return 32;
@@ -762,7 +732,7 @@ class Elaborator {
     bool isSigned(const Expr& e) const {
         switch (e.kind) {
         case ExprKind::IDENTIFIER:
-            if (params.count(e.name)) return !unsigned_params.count(e.name);
+            if (params.count(e.name)) return params.at(e.name)->is_signed;
             return lookupSignal(e.name, e.line).is_signed;
         case ExprKind::NUMBER:
             return e.is_signed;
@@ -802,7 +772,7 @@ class Elaborator {
         switch (e.kind) {
         case ExprKind::IDENTIFIER: {
             auto it = params.find(e.name);
-            if (it != params.end()) return constantBits(it->second, width);
+            if (it != params.end()) return evaluateT(*it->second, width, sx);
             if (lookupSignal(e.name, e.line).is_memory) errorAt(e.line, "memory '" + e.name + "' must be indexed: " + e.name + "[i]");
             return extend(checkedRead(currentBits(e.name, e.line), e), width, sx);
         }
@@ -825,7 +795,20 @@ class Elaborator {
                 if (e.operands.size() != 1) errorAt(e.line, e.name + " takes one argument");
                 return extend(evaluateSelf(*e.operands[0]), width, sx);
             }
-            if (e.name == "$clog2") return constantBits(requireConst(e, "$clog2 needs a constant argument"), width);
+            if (e.name == "$clog2") {
+                if (!isConstant(e)) errorAt(e.line, "$clog2 needs a constant argument");
+                Bits arg = evaluateSelf(*e.operands[0]);
+                // ceil(log2(n)) = bit length of n-1, interpreting the argument as unsigned.
+                size_t highest = 0;
+                bool lower_one = false;
+                for (size_t i = 0; i < arg.size(); ++i) {
+                    if (isConst(arg[i], true)) {
+                        highest = i + lower_one;
+                        lower_one = true;
+                    }
+                }
+                return constantBits(highest, width);
+            }
             if (!e.name.empty() && e.name[0] == '$') errorAt(e.line, "system function " + e.name + " is not supported");
             return extend(callFunction(e), width, sx);
         }
@@ -844,6 +827,7 @@ class Elaborator {
         case ExprKind::CONCAT: {
             Bits out;   // the last operand holds the least significant bits
             for (auto it = e.operands.rbegin(); it != e.operands.rend(); ++it) {
+                if ((*it)->kind == ExprKind::REPLICATE && replicationCount(**it) == 0) continue;
                 Bits part = evaluateSelf(**it);
                 out.insert(out.end(), part.begin(), part.end());
             }
@@ -886,6 +870,43 @@ class Elaborator {
         else errorAt(e.line, "unsupported unary operator '" + e.op + "'");
         if (e.op == "~&" || e.op == "~|" || e.op == "~^") r = notGate(r);
         return resize({r}, width);
+    }
+
+    Bits divideConstant(const Expr& e, long long width, bool sign) {
+        Bits a = evaluateT(*e.operands[0], width, sign);
+        Bits b = evaluateT(*e.operands[1], width, sign);
+        auto negate = [&](Bits& v) {
+            for (auto& bit : v) bit = notGate(bit);
+            v = add(v, constantBits(0, width), constant(true));
+        };
+        bool neg_a = sign && isConst(a.back(), true), neg_b = sign && isConst(b.back(), true);
+        if (neg_a) negate(a);
+        if (neg_b) negate(b);
+        // Subtract from high to low, using only the significant divisor bits.
+        long long size = width;
+        while (size && isConst(b[size - 1], false)) --size;
+        if (!size) errorAt(e.line, "division by zero in constant expression");
+        Bits quotient(width, constant(false));
+        for (long long offset = width - size; offset >= 0; --offset) {
+            long long j = size - 1;
+            while (j >= 0 && a[offset + j] == b[j]) --j;
+            bool carry_bit = offset + size < width && isConst(a[offset + size], true);
+            if (!carry_bit && j >= 0 && isConst(a[offset + j], false)) continue;
+            bool borrow = false;
+            for (long long k = 0; k < size; ++k) {
+                int diff = int(isConst(a[offset + k], true)) - int(isConst(b[k], true)) - borrow;
+                a[offset + k] = constant(diff % 2 != 0);
+                borrow = diff < 0;
+            }
+            if (borrow) a[offset + size] = constant(false);
+            quotient[offset] = constant(true);
+        }
+        if (e.op == "%") {
+            if (neg_a) negate(a);
+            return a;
+        }
+        if (neg_a != neg_b) negate(quotient);
+        return quotient;
     }
 
     Bits evaluateBinary(const Expr& e, long long width, bool sx) {
@@ -941,20 +962,21 @@ class Elaborator {
             return add(evaluateT(lhs, width, sx), b, constant(true));
         }
         if (op == "*") {
-            if (isConstant(e)) return constantBits(evalConst(e), width);
             return multiply(evaluateT(lhs, width, sx), evaluateT(rhs, width, sx), width);
         }
         if (op == "/" || op == "%") {
             if (!isConstant(e)) errorAt(e.line, "'" + op + "' is only supported between constants (no divider yet)");
-            return constantBits(evalConst(e), width);
+            return divideConstant(e, width, sx);
         }
         if (op == "<<" || op == ">>" || op == "<<<" || op == ">>>") {
             Bits a = evaluateT(lhs, width, sx);
             bool left = op == "<<" || op == "<<<";
             NodePtr fill = op == ">>>" && sx ? a.back() : constant(false);   // >>> is arithmetic when signed
             if (isConstant(rhs)) {
-                long long amount = evalConst(rhs);
-                if (amount < 0) errorAt(e.line, "shift amount must not be negative");
+                Bits distance = evaluateSelf(rhs);
+                long long amount = 0;
+                for (auto it = distance.rbegin(); it != distance.rend() && amount < width; ++it)
+                    amount = 2 * amount + isConst(*it, true);
                 Bits out(static_cast<size_t>(width), fill);
                 for (long long i = 0; i < width; ++i) {
                     long long from = left ? i - amount : i + amount;
@@ -1088,7 +1110,7 @@ class Elaborator {
         return n;
     }
 
-    long long genConst(const ExprPtr& e, const Subst& sb, const char* what) const {
+    long long genConst(const ExprPtr& e, const Subst& sb, const char* what) {
         return requireConst(*subst(e, sb), std::string(what) + " must be a constant (parameters and genvars only)");
     }
 
@@ -1098,7 +1120,8 @@ class Elaborator {
             if (!scope.empty()) sb.renames[n.name] = scope + n.name;
         }
         for (const auto& p : body.params) {   // generate-local parameters are constants of this scope
-            sb.consts[p.name] = numberExpr(genConst(p.value, sb, "a generate-block parameter"), p.line);
+            long long width = p.msb ? declWidth(subst(p.msb, sb), subst(p.lsb, sb), p.line) : 0;
+            sb.consts[p.name] = constantLiteral(*subst(p.value, sb), width);
         }
         for (const auto& n : body.nets) {
             NetDecl d = n;
@@ -1153,15 +1176,21 @@ class Elaborator {
             else if (g.else_body) emitGenerateBody(*g.else_body, sb, scoped(g.else_body->name));
             break;
         case GenerateBlock::CASE: {
-            long long v = genConst(g.cond, sb, "a generate case expression");
+            ExprPtr selector = constantLiteral(*subst(g.cond, sb));
             const std::pair<std::vector<ExprPtr>, std::shared_ptr<Module>>* chosen = nullptr;
-            for (const auto& c : g.cases) {
-                if (c.first.empty()) {
-                    if (!chosen) chosen = &c;   // default, unless a label matches
+            // Generate expressions are elaborated constants. Compare each item's
+            // value with the selector after evaluating both at their own widths.
+            for (const auto& item : g.cases) {
+                if (item.first.empty()) {
+                    if (!chosen) chosen = &item;
                     continue;
                 }
-                for (const auto& label : c.first) {
-                    if (genConst(label, sb, "a generate case label") == v && (!chosen || chosen->first.empty())) chosen = &c;
+                for (const auto& expr : item.first) {
+                    ExprPtr label = constantLiteral(*subst(expr, sb));
+                    long long width = std::max(selfWidth(*selector), selfWidth(*label));
+                    bool sign = isSigned(*selector) && isSigned(*label);
+                    if ((!chosen || chosen->first.empty()) &&
+                        evaluateT(*selector, width, sign) == evaluateT(*label, width, sign)) chosen = &item;
                 }
             }
             if (chosen) emitGenerateBody(*chosen->second, sb, scoped(chosen->second->name));
@@ -1188,16 +1217,9 @@ class Elaborator {
         for (const auto& p : module.params) {
             if (params.count(p.name)) errorAt(p.line, "parameter '" + p.name + "' is already declared");
             auto it = param_values.find(p.name);
-            long long value = it != param_values.end() && !p.is_local
-                                  ? it->second
-                                  : requireConst(*p.value, "value of parameter '" + p.name + "' must be a constant expression");
-            if (p.msb) {
-                long long w = std::abs(requireConst(*p.msb, "parameter range must be constant") -
-                                       requireConst(*p.lsb, "parameter range must be constant")) + 1;
-                if (w < 63) value &= (1LL << w) - 1;
-                unsigned_params.insert(p.name);
-            }
-            params[p.name] = value;
+            long long width = p.msb ? declWidth(p.msb, p.lsb, p.line) : 0;
+            params[p.name] = it != param_values.end() && !p.is_local
+                                 ? it->second(width) : constantLiteral(*p.value, width);
         }
     }
 
@@ -1433,12 +1455,12 @@ class Elaborator {
         return *it->second;
     }
 
-    long long declWidth(const ExprPtr& msb, const ExprPtr& lsb, size_t line) const {
+    long long declWidth(const ExprPtr& msb, const ExprPtr& lsb, size_t line) {
         if (!msb) return 1;
         return checkedWidth(std::abs(requireConst(*msb, "range must be constant") - requireConst(*lsb, "range must be constant")) + 1, line);
     }
 
-    long long functionWidth(const Expr& call) const {
+    long long functionWidth(const Expr& call) {
         const FunctionDecl& f = findFunction(call.name, call.line, false);
         return declWidth(f.msb, f.lsb, f.line);
     }
@@ -1471,10 +1493,14 @@ class Elaborator {
         }
 
         // Locals shadow module signals for the duration of the call
-        std::vector<std::pair<std::string, std::optional<Signal>>> saved;
+        struct Binding { std::string name; std::optional<Signal> signal; ExprPtr param; bool integer; };
+        std::vector<Binding> saved;
         auto declare = [&](const NetDecl& d, const Bits* value) {
             auto it = signals.find(d.name);
-            saved.emplace_back(d.name, it == signals.end() ? std::nullopt : std::optional<Signal>(it->second));
+            auto p = params.find(d.name);
+            saved.push_back({d.name, it == signals.end() ? std::nullopt : std::optional<Signal>(it->second),
+                             p == params.end() ? nullptr : p->second, integers.erase(d.name) != 0});
+            if (p != params.end()) params.erase(p);
             if (d.kind == NetKind::INTEGER) {
                 integers.insert(d.name);
                 signals.erase(d.name);
@@ -1512,7 +1538,7 @@ class Elaborator {
 
         Env env;
         if (overrides) env.blocking = *overrides;   // the caller's current values of module regs
-        for (const auto& [name, v] : saved) env.blocking.erase(name);
+        for (const auto& binding : saved) env.blocking.erase(binding.name);
         BlockKind saved_kind = block_kind;
         const std::map<std::string, Bits>* saved_overrides = overrides;
         NodePtr saved_path = path_cond;
@@ -1530,9 +1556,11 @@ class Elaborator {
             out.push_back(v);
         }
         for (auto it = saved.rbegin(); it != saved.rend(); ++it) {
-            signals.erase(it->first);
-            integers.erase(it->first);
-            if (it->second) signals[it->first] = *it->second;
+            signals.erase(it->name);
+            integers.erase(it->name);
+            if (it->signal) signals[it->name] = *it->signal;
+            if (it->integer) integers.insert(it->name);
+            if (it->param) params[it->name] = it->param;
         }
         call_depth--;
         return out;
@@ -1694,65 +1722,71 @@ class Elaborator {
                 items.push_back(&item);
             }
         }
-        auto wildLabel = [&](const Expr& label) { return label.kind == ExprKind::NUMBER && !label.wild.empty(); };
-        for (const CaseItem* item : items) {
-            for (const auto& label : item->labels) {
-                if (wildLabel(*label) && s.case_wild == 0) {
-                    errorAt(label->line, "x/z/? in a case label never matches in synthesis: use casez / casex");
-                }
-            }
+        // IEEE 1364 §9.5 sizes the selector and all labels as one comparison.
+        long long width = ws;
+        bool sign = isSigned(*s.cond);
+        for (const auto* item : items) for (const auto& label : item->labels) {
+            width = std::max(width, selfWidth(*label));
+            sign &= isSigned(*label);
         }
-        // A case listing every value of its subject needs no default (no latch)
-        if (!fallback && ws <= 12 && !items.empty()) {
-            std::set<long long> values;
-            bool all_constant = true;
-            for (const CaseItem* item : items) {
-                for (const auto& label : item->labels) {
-                    if (wildLabel(*label)) {
-                        long long care = 0, value = 0;
-                        for (size_t i = 0; i < label->bits.size() && i < 63; ++i) {
-                            if (!label->wild[i]) care |= 1LL << i;
-                            if (label->bits[i]) value |= 1LL << i;
-                        }
-                        for (long long v = 0; v < (1LL << ws); ++v) {
-                            if ((v & care) == (value & care)) values.insert(v);
-                        }
+        Bits selector = evaluateT(*s.cond, width, sign);
+        std::vector<bool> covered(!fallback && ws <= 12 ? 1U << ws : 0, false);
+        std::vector<NodePtr> conditions;
+        for (const auto* item : items) {
+            std::vector<NodePtr> hits;
+            for (const auto& label : item->labels) {
+                Bits pattern;
+                if (label->wild.empty()) {
+                    pattern = evaluateT(*label, width, sign);
+                } else {
+                    if (!s.case_wild)
+                        errorAt(label->line, "x/z/? in a case label never matches in synthesis: use casez / casex");
+                    if (s.case_wild == 1 && std::find(label->wild.begin(), label->wild.end(),
+                                                      LiteralDigit::X) != label->wild.end()) continue;
+                    for (size_t j = 0; j < label->bits.size(); ++j)
+                        pattern.push_back(label->wild[j] == LiteralDigit::Known ? constant(label->bits[j]) : nullptr);
+                    pattern = extend(std::move(pattern), width, sign);
+                }
+                Bits equal;
+                unsigned mask = 0, value = 0;
+                bool enumerable = !covered.empty();
+                for (long long j = 0; j < width; ++j) {
+                    if (!pattern[j]) continue;
+                    equal.push_back(xnorGate(selector[j], pattern[j]));
+                    if (!enumerable) continue;
+                    bool one = isConst(pattern[j], true);
+                    if (!one && !isConst(pattern[j], false)) { enumerable = false; continue; }
+                    if (isConst(selector[j], true) || isConst(selector[j], false)) {
+                        enumerable = selector[j] == pattern[j];
                         continue;
                     }
-                    if (!isConstant(*label)) { all_constant = false; break; }
-                    values.insert(evalConst(*label) & ((1LL << ws) - 1));
+                    // Higher bits must be known or repeat the selector sign.
+                    // Arithmetic selectors may acquire extra bits in this context.
+                    if (j >= ws && selector[j] != selector[ws - 1]) { enumerable = false; continue; }
+                    unsigned bit = 1U << std::min(j, ws - 1);
+                    if ((mask & bit) && bool(value & bit) != one) enumerable = false;
+                    mask |= bit;
+                    if (one) value |= bit;
+                }
+                hits.push_back(equal.empty() ? constant(true) : reduce(GateType::AND, equal));
+                if (enumerable) {
+                    if (mask == covered.size() - 1) covered[value] = true;
+                    else for (unsigned v = 0; v < covered.size(); ++v)
+                        if ((v & mask) == value) covered[v] = true;
                 }
             }
-            if (all_constant && static_cast<long long>(values.size()) == (1LL << ws)) {
-                fallback = items.back();
-                items.pop_back();
-            }
+            conditions.push_back(hits.empty() ? constant(false) : reduce(GateType::OR, hits));
+        }
+        if (!covered.empty() && std::all_of(covered.begin(), covered.end(), [](bool v) { return v; })) {
+            fallback = items.back();
+            items.pop_back();
         }
         std::function<void(size_t, Env&)> from = [&](size_t k, Env& e) {
             if (k == items.size()) {
                 if (fallback) exec(*fallback->body, e);
                 return;
             }
-            Bits hits;
-            for (const auto& label : items[k]->labels) {
-                long long w = std::max(ws, selfWidth(*label));
-                Bits a = evaluate(*s.cond, w);
-                Bits same;
-                if (wildLabel(*label)) {   // casez / casex: wildcard bits match anything
-                    for (long long i = 0; i < w; ++i) {
-                        bool known = i < static_cast<long long>(label->bits.size());
-                        if (known && label->wild[i]) continue;
-                        bool bit = known && label->bits[i];
-                        same.push_back(bit ? a[i] : notGate(a[i]));
-                    }
-                    hits.push_back(same.empty() ? constant(true) : reduce(GateType::AND, same));
-                    continue;
-                }
-                Bits b = evaluate(*label, w);
-                for (long long i = 0; i < w; ++i) same.push_back(xnorGate(a[i], b[i]));
-                hits.push_back(reduce(GateType::AND, same));
-            }
-            NodePtr c = reduce(GateType::OR, hits);
+            NodePtr c = conditions[k];
             if (isConst(c, true)) { exec(*items[k]->body, e); return; }
             if (isConst(c, false)) { from(k + 1, e); return; }
             Env t = e, f = e;
@@ -1776,18 +1810,18 @@ class Elaborator {
             errorAt(s.line, "the for-loop step must assign the loop variable '" + var.name + "'");
         }
         if (params.count(var.name)) errorAt(s.line, "nested loops over the same variable '" + var.name + "'");
-        params[var.name] = requireConst(*s.init->rhs, "for-loop start value must be a constant");
+        params[var.name] = numberExpr(requireConst(*s.init->rhs, "for-loop start value must be a constant"), s.line);
         long long iterations = 0;
         while (requireConst(*s.cond, "for-loop condition must be constant (it can use the loop variable)")) {
             if (++iterations > 65536) errorAt(s.line, "for loop runs more than 65536 times");
             exec(*s.body, env);
-            params[var.name] = requireConst(*s.step->rhs, "for-loop step must be a constant expression");
+            params[var.name] = numberExpr(requireConst(*s.step->rhs, "for-loop step must be a constant expression"), s.line);
         }
         params.erase(var.name);
     }
 
     // Async reset: "if (!rst_n)" / "if (rst)" at the top of the block, matching the edge
-    bool resetTest(const Expr& c, const EdgeEvent& ev, bool& active_low) const {
+    bool resetTest(const Expr& c, const EdgeEvent& ev, bool& active_low) {
         const Expr* e = &c;
         bool negated = false;
         if (e->kind == ExprKind::UNARY && (e->op == "!" || e->op == "~")) {
@@ -2007,7 +2041,7 @@ class Elaborator {
             for (const auto& p : child_module.params) {
                 if (!p.is_local) overridable.push_back(p.name);
             }
-            std::unordered_map<std::string, long long> values;
+            Overrides values;
             for (size_t k = 0; k < inst.params.size(); ++k) {
                 const Connection& c = inst.params[k];
                 if (!c.expr) errorAt(c.line, "empty parameter override");
@@ -2018,7 +2052,7 @@ class Elaborator {
                 } else if (std::find(overridable.begin(), overridable.end(), name) == overridable.end()) {
                     errorAt(c.line, "module '" + inst.module + "' has no parameter '" + name + "' that can be overridden");
                 }
-                values[name] = requireConst(*c.expr, "parameter values of an instance must be constants");
+                values[name] = [this, expr = c.expr](long long width) { return constantLiteral(*expr, width); };
             }
 
             sh.stack.push_back(inst.module);
@@ -2393,7 +2427,7 @@ class Elaborator {
     }
 
 public:
-    Elaborator(const Module& m, Shared& shared, std::string pre, std::unordered_map<std::string, long long> values, bool top)
+    Elaborator(const Module& m, Shared& shared, std::string pre, Overrides values, bool top)
         : module(m), sh(shared), prefix(std::move(pre)), is_top(top), param_values(std::move(values)) {}
 
     Design run() {

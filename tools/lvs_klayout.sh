@@ -43,17 +43,24 @@ def section(name):
     return m.group(1) if m else ''
 comps = re.findall(r'-\s+(\S+)\s+(\S+)', section('COMPONENTS'))
 conn = {}   # (instance, pin) -> net
+supplies = {use: net for net, use in re.findall(r'^\s*- (\S+) [^\n]*?\+ USE (POWER|GROUND)', section('SPECIALNETS'), re.M)}
 ports = []
 pins_on = {}   # net -> the top-level pins on it
 for stmt in section('PINS').split(';'):
     m = re.search(r'-\s+(\S+)\s+\+\s+NET\s+(\S+)', stmt)
-    if m and m.group(1) not in ('VDD', 'VSS'):
+    if m and m.group(2) not in supplies.values():
         ports.append(m.group(2))
         pins_on.setdefault(m.group(2), []).append(m.group(1))
 # A net with several top-level pins (an input wired straight to an output, `assign y = a`):
 # the extracted layout names it after all its labels, sorted and joined by commas, so the
 # schematic does the same (LVS then still checks that those pins share one net)
-alias = {n: ','.join(sorted(p)) for n, p in pins_on.items() if len(p) > 1}
+alias = {n: ','.join(sorted(p)) for n, p in pins_on.items()}
+if any(len(p) > 1 for p in pins_on.values()):
+    # Device extraction can discard a metal-only net. Check its physical connectivity below.
+    from pathlib import Path
+    Path(out_path).with_name('feedthrough').touch()
+    if all(re.fullmatch(r'sg13cmos5l_fill_\d+', master) for _, master in comps):
+        Path(out_path).with_name('metal_only').touch()
 for stmt in section('NETS').split(';'):
     m = re.match(r'\s*-\s+(\S+)', stmt)
     if not m: continue
@@ -67,13 +74,13 @@ with open(out_path, 'w') as f:
     for path in cdls: f.write('.INCLUDE %s\n' % path.split('/')[-1])
     for m, pins in blackbox.items(): f.write('.SUBCKT %s %s\n.ENDS\n' % (m, ' '.join(pins)))
     uniq = list(dict.fromkeys(ports))
-    f.write('.SUBCKT %s %s VDD VSS\n' % (re.search(r'DESIGN (\S+)', text).group(1), ' '.join(spice(p) for p in uniq)))
+    f.write('.SUBCKT %s %s %s %s\n' % (re.search(r'DESIGN (\S+)', text).group(1), ' '.join(spice(p) for p in uniq), supplies['POWER'], supplies['GROUND']))
     for inst, master in comps:
         if master not in order or 'fill' in master or 'decap' in master: continue
         nets = []
         for pin in order[master]:
-            if pin in ('VDD', 'VDD!', 'VDDARRAY!'): nets.append('VDD'); continue   # SRAM supplies join the grid
-            if pin in ('VSS', 'VSS!'): nets.append('VSS'); continue
+            if pin in ('VDD', 'VDD!', 'VDDARRAY!'): nets.append(supplies['POWER']); continue   # SRAM supplies join the grid
+            if pin in ('VSS', 'VSS!'): nets.append(supplies['GROUND']); continue
             n = conn.get((inst, pin)) or conn.get((inst, pin.replace('<', '[').replace('>', ']')))   # CDL buses use <k>
             if n is None: unc += 1; n = 'unconnected_%d' % unc
             nets.append(spice(n))
@@ -84,7 +91,7 @@ PY
 # SRAM pins: the LVS above treats SRAMs as black boxes, so their connections are checked here
 # by probing the extracted metal: each SRAM pin must sit on the same net as another pin of its
 # DEF net (no open), and pins of different nets must never share one (no short)
-if [ -n "$SRAMS" ]; then
+if [ -n "$SRAMS" ] || [ -f "$TMP/feedthrough" ]; then
 python3 - "$DEF" "$REF" "$TMP/probes.json" "$SRAMS" <<'PY'
 import re, sys, json
 def_path, ref, out_path, srams = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4].split()
@@ -124,6 +131,25 @@ def pin_point(inst, pin):
     if o in ('FN', 'S'): cx = w - cx
     return layer, x + cx, y + cy
 probes = []
+ports = {}
+for stmt in section('PINS').split(';'):
+    pin = re.search(r'-\s+(\S+)\s+\+\s+NET\s+(\S+)', stmt)
+    if not pin: continue
+    ports.setdefault(pin[2], []).append((pin[1], stmt))
+if any(len(pins) > 1 for pins in ports.values()):
+    # Check every labelled net for shorts to a feedthrough, including the supplies.
+    for net, pins in ports.items():
+        points = []
+        for name, stmt in pins:
+            shape = re.search(r'\+ LAYER (\S+) \( (-?\d+) (-?\d+) \) \( (-?\d+) (-?\d+) \)', stmt)
+            pos = re.search(r'\+ (?:PLACED|FIXED) \( (-?\d+) (-?\d+) \) (\w+)', stmt)
+            if not shape or not pos or pos[3] != 'N':
+                raise ValueError('unsupported fastpnr pin geometry for ' + name)
+            cx = (int(shape[2]) + int(shape[4])) / 2 + int(pos[1])
+            cy = (int(shape[3]) + int(shape[5])) / 2 + int(pos[2])
+            points.append([name, shape[1], cx/dbu, cy/dbu])
+        for point in points:
+            probes.append({'net': net, 'pin': point, 'other': points[0]})
 for stmt in section('NETS').split(';'):
     m = re.match(r'\s*-\s+(\S+)', stmt)
     if not m: continue
@@ -133,7 +159,7 @@ for stmt in section('NETS').split(';'):
     for inst, pin in sram:
         a = pin_point(inst, pin)
         b = pin_point(*other[0]) if other else None
-        if a: probes.append({'net': m.group(1), 'sram': [inst + '/' + pin, *a], 'other': [other[0][0] + '/' + other[0][1], *b] if b else None})
+        if a: probes.append({'net': m.group(1), 'pin': [inst + '/' + pin, *a], 'other': [other[0][0] + '/' + other[0][1], *b] if b else None})
 json.dump(probes, open(out_path, 'w'))
 PY
 cat > "$TMP/probe.py" <<'EOF2'
@@ -145,7 +171,7 @@ l2n = pya.LayoutToNetlist(pya.RecursiveShapeIterator(ly, top, []))
 layers = {}
 stack = [('Metal1', 8), ('Via1', 19), ('Metal2', 10), ('Via2', 29), ('Metal3', 30), ('Via3', 49), ('Metal4', 50), ('TopVia1', 125), ('TopMetal1', 126)]
 for name, n in stack:
-    shapes = [l2n.make_layer(ly.layer(n, d), '%s_%d' % (name, d)) for d in ((0, 2) if not name.startswith(('Via', 'Top' 'Via')) else (0,))]
+    shapes = [l2n.make_layer(ly.layer(n, d), '%s_%d' % (name, d)) for d in ((0, 2) if not name.startswith(('Via', 'TopVia')) else (0,))]
     for r in shapes: l2n.connect(r)
     for a in shapes:
         for b in shapes:
@@ -163,16 +189,16 @@ def probe(layer, x, y):
 opens, shorts, owner = 0, 0, {}
 for p in json.load(open('/w/probes.json')):
     if not p['other']: continue   # an unused SRAM output: nothing else on its net
-    a = probe(*p['sram'][1:])
+    a = probe(*p['pin'][1:])
     if a is None:
-        print('OPEN  %s: nothing at the SRAM pin' % p['sram'][0]); opens += 1; continue
+        print('OPEN  %s: no metal at pin' % p['pin'][0]); opens += 1; continue
     if p['other']:
         b = probe(*p['other'][1:])
-        if b != a: print('OPEN  %s (net %s) does not reach %s' % (p['sram'][0], p['net'], p['other'][0])); opens += 1
+        if b != a: print('OPEN  %s (net %s) does not reach %s' % (p['pin'][0], p['net'], p['other'][0])); opens += 1
     if a in owner and owner[a] != p['net']:
-        print('SHORT %s: nets %s and %s' % (p['sram'][0], owner[a], p['net'])); shorts += 1
+        print('SHORT %s: nets %s and %s' % (p['pin'][0], owner[a], p['net'])); shorts += 1
     owner[a] = p['net']
-print('SRAM pins probed: %d, opens %d, shorts %d' % (sum(1 for q in json.load(open('/w/probes.json')) if q['other']), opens, shorts))
+print('Layout pins probed: %d, opens %d, shorts %d' % (sum(1 for q in json.load(open('/w/probes.json')) if q['other']), opens, shorts))
 EOF2
 fi
 cp "$REF/sg13cmos5l_stdcell/cdl/sg13cmos5l_stdcell.cdl" "$TMP/"
@@ -205,16 +231,20 @@ if "$SRAMS".split():
             layout.cell(m).copy_shapes(abstract.cell(m), lm)
 layout.write('/w/out.gds')
 EOF
+# Deep simplification removes a top made entirely of filler and wire. Preserve
+# that circuit for the deck comparison and check all of its port metals above.
+deck_options="--run_mode=deep"
+if [ -f "$TMP/metal_only" ]; then deck_options="--run_mode=flat --no_simplify --top_lvl_pins"; fi
 docker run --rm --user "$(id -u):$(id -g)" -e HOME=/w -v "$TMP:/w" -v "$PDK_DIR:/pdk:ro" "$IMAGE" bash -c "
   cd /w && klayout -b -r /w/def2gds.py > /w/convert.log 2>&1 &&
   python3 /pdk/ihp-sg13cmos5l/libs.tech/klayout/tech/lvs/run_lvs.py --layout=/w/out.gds --netlist=/w/top.cdl --run_dir=/w/run \
-    --topcell=$TOP --run_mode=deep --disable_tap_extraction > /w/lvs.log 2>&1;
+    --topcell=$TOP $deck_options --disable_tap_extraction > /w/lvs.log 2>&1;
   if [ -f /w/probe.py ]; then klayout -b -r /w/probe.py > /w/probe.log 2>&1; fi" || true
 [ -n "${LVS_KEEP:-}" ] && cp -r "$TMP"/lvs.log "$TMP"/top.cdl "$TMP"/run "$TMP"/out.gds "$TMP"/probes.json "$TMP"/probe.py "$TMP"/probe.log "$TMP"/convert.log "$LVS_KEEP"/ 2>/dev/null || true   # some files exist only with SRAMs
 status=0
-if [ -n "$SRAMS" ]; then
-    if grep -q 'opens 0, shorts 0' "$TMP/probe.log" 2>/dev/null; then grep 'SRAM pins probed' "$TMP/probe.log"
-    else echo "SRAM pin check FAILED"; grep -E 'OPEN|SHORT|probed|Error|ERROR' "$TMP/probe.log" | head -8; status=1; fi
+if [ -f "$TMP/probes.json" ]; then
+    if grep -q 'opens 0, shorts 0' "$TMP/probe.log" 2>/dev/null; then grep 'Layout pins probed' "$TMP/probe.log"
+    else echo "Layout pin check FAILED"; grep -E 'OPEN|SHORT|probed|Error|ERROR' "$TMP/probe.log" | head -8; status=1; fi
 fi
 if grep -q 'Congratulations! Netlists match' "$TMP/lvs.log"; then
     echo "LVS: netlists match ($(grep -oE 'Devices to compare: layout=[0-9]+' "$TMP/lvs.log" | grep -oE '[0-9]+$') device types compared)"

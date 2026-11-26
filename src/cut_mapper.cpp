@@ -454,7 +454,9 @@ class CutMapper {
             r = std::min(r, target);
         }
         for (uint32_t node = static_cast<uint32_t>(aig.nodeCount()); node-- > 1;) {
-            for (int phase = 1; phase >= 0; --phase) {   // phase 1 may be an inverter of phase 0
+            // Propagate through a local inverter before visiting its driving cut.
+            int first = best[node][0].kind == Choice::INVERT ? 0 : 1;
+            for (int phase : {first, 1 - first}) {
                 double r = required[node][phase];
                 if (r == kInf) continue;
                 const Choice& c = best[node][phase];

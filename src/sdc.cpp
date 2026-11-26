@@ -1,5 +1,8 @@
 #include "../include/sdc.hpp"
+#include <algorithm>
 #include <cctype>
+#include <iomanip>
+#include <limits>
 #include <cmath>
 #include <fstream>
 #include <functional>
@@ -131,7 +134,7 @@ class Interp {
         try {
             size_t used = 0;
             double v = std::stod(s, &used);
-            if (used == s.size()) return v;
+            if (used == s.size() && std::isfinite(v)) return v;
         } catch (const std::exception&) {
         }
         error("expected a number, got '" + s + "'");
@@ -147,16 +150,21 @@ class Interp {
                 i++;
                 double v = sum();
                 space();
+                if (i == e.size() || e[i] != ')') error("expected ')' in expr");
                 i++;
                 return v;
             }
-            if (i < e.size() && e[i] == '-') {
-                i++;
-                return -atom();
+            if (i < e.size() && (e[i] == '-' || e[i] == '+')) {
+                bool negative = e[i++] == '-';
+                double v = atom();
+                return negative ? -v : v;
             }
-            size_t start = i;
-            while (i < e.size() && (std::isdigit(static_cast<unsigned char>(e[i])) || e[i] == '.' || e[i] == 'e' || e[i] == 'E')) i++;
-            return num(e.substr(start, i - start));
+            size_t used = 0;
+            double v;
+            try { v = std::stod(e.substr(i), &used); }
+            catch (const std::exception&) { error("expected a number in expr"); }
+            i += used;
+            return v;
         };
         product = [&]() -> double {
             double v = atom();
@@ -176,7 +184,9 @@ class Interp {
             }
             return v;
         };
-        return sum();
+        double value = sum();
+        if (i != e.size() || !std::isfinite(value)) error("invalid arithmetic expression: " + e);
+        return value;
     }
 
     std::string evaluate(const std::string& cmd) {
@@ -229,7 +239,7 @@ class Interp {
             for (size_t k = 1; k < w.size(); ++k) e += w[k] + " ";
             size_t i = 0;
             std::ostringstream out;
-            out << exprValue(e, i);
+            out << std::setprecision(std::numeric_limits<double>::max_digits10) << exprValue(e, i);
             return out.str();
         }
         if (c == "get_ports" || c == "get_clocks" || c == "get_pins" || c == "get_nets" || c == "get_cells") {
@@ -242,11 +252,44 @@ class Interp {
             for (const auto& k : sdc.clocks) names.push_back(k.name);
             return joinList(names);
         }
-        if (c == "current_design" || c == "set_units" || c == "puts") return "";
+        if (c == "current_design") return "@current_design";
+        if (c == "set_units" || c == "puts") return "";
+
+        if (c == "set_timing_derate") {
+            auto pos = positional({});
+            static const std::vector<std::string> options = {"-early", "-late", "-rise", "-fall", "-clock",
+                                                             "-data", "-cell_delay", "-net_delay", "-cell_check"};
+            bool unsupported = false;
+            for (size_t k = 1; k < w.size(); ++k) {
+                if (!w[k].empty() && w[k][0] == '-' && std::find(options.begin(), options.end(), w[k]) == options.end())
+                    unsupported = true;
+            }
+            if (unsupported || (pos.size() != 1 && !(pos.size() == 2 && pos[1] == "@current_design"))) {
+                sdc.warnings.push_back("unsupported options or object scope on set_timing_derate");
+                return "";
+            }
+            if (has("-early") == has("-late")) error("set_timing_derate needs exactly one of -early and -late");
+            double factor = num(pos[0]);
+            if (!(factor > 0)) error("set_timing_derate needs a positive factor");
+            auto selected = [&](const char* flag, const char* other) { return has(flag) || !has(other); };
+            bool explicit_type = has("-cell_delay") || has("-net_delay") || has("-cell_check");
+            for (auto type : {DerateType::Cell, DerateType::Net, DerateType::Check}) {
+                const char* flag = type == DerateType::Cell ? "-cell_delay" : type == DerateType::Net ? "-net_delay" : "-cell_check";
+                if (!has(flag) && (explicit_type || type == DerateType::Check)) continue;
+                for (int clk = 0; clk < 2; ++clk) for (int fall = 0; fall < 2; ++fall) for (int late = 0; late < 2; ++late) {
+                    if (selected(clk ? "-clock" : "-data", clk ? "-data" : "-clock") &&
+                        selected(fall ? "-fall" : "-rise", fall ? "-rise" : "-fall") &&
+                        selected(late ? "-late" : "-early", late ? "-early" : "-late"))
+                        sdc.derates.factors[static_cast<int>(type)][clk][fall][late] = factor;
+                }
+            }
+            return "";
+        }
 
         if (c == "create_clock") {
             SdcClock clk;
             clk.period = num(option("-period")) * time_scale;
+            if (!(clk.period > 0)) error("create_clock needs a positive period");
             std::vector<std::string> objs = positional({"-period", "-name", "-waveform", "-add"});
             for (const auto& o : objs) {
                 for (const auto& item : splitList(o)) clk.sources.push_back(item);

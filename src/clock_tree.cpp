@@ -1,6 +1,11 @@
 #include "../include/clock_tree.hpp"
 #include <algorithm>
-#include <cstdint>
+#include "../include/timer.hpp"
+#include <cmath>
+#include <iterator>
+#include <limits>
+#include <map>
+#include <tuple>
 #include <functional>
 #include <unordered_set>
 #include <stdexcept>
@@ -143,102 +148,134 @@ BufferNetsReport bufferHighFanoutNets(CellNetlist& nl, const Library& lib, int m
     return report;
 }
 
-int repairFastHoldPaths(CellNetlist& nl, const Library& lib, int max_short_hops, int max_setup_hops) {
-    const LibCell* dly = lib.find("sg13cmos5l_dlygate4sd3_1");
-    if (!dly) dly = lib.find("sg13cmos5l_dlygate4sd2_1");
-    if (!dly) dly = lib.find("sg13cmos5l_buf_1");
-    const LibCell* fast_buf = lib.find("sg13cmos5l_buf_1");
-    if (!fast_buf) fast_buf = dly;
-    int in_pin = -1, out_pin = -1, fin_pin = -1, fout_pin = -1;
-    if (!findBufferPins(dly, in_pin, out_pin)) return 0;
-    if (!findBufferPins(fast_buf, fin_pin, fout_pin)) { fast_buf = dly; fin_pin = in_pin; fout_pin = out_pin; }
+namespace {
+using Check = std::tuple<std::string, std::string, Edge>;
+using Slacks = std::map<Check, double>;
 
-    size_t n_nets = nl.netCount();
-    size_t n_insts = nl.instances.size();
-    std::vector<int> net_driver_inst(n_nets, -1);
-    for (size_t i = 0; i < n_insts; ++i) {
-        const auto& inst = nl.instances[i];
+// The timer follows instance cell pointers for delays, slews and constraints.
+Slacks cornerSlacks(CellNetlist nl, const Library& corner, const Sdc& sdc, bool late) {
+    for (auto& inst : nl.instances) {
+        const LibCell* cell = corner.find(inst.cell->name);
+        if (!cell || cell->pins.size() != inst.pin_net.size())
+            throw std::runtime_error("hold repair: missing or incompatible corner cell " + inst.cell->name);
+        std::vector<int> nets(cell->pins.size(), -1);
         for (size_t k = 0; k < inst.pin_net.size(); ++k) {
-            int n = inst.pin_net[k];
-            if (n >= 2 && static_cast<size_t>(n) < n_nets && inst.cell->pins[k].dir == PinDir::OUTPUT) {
-                net_driver_inst[n] = static_cast<int>(i);
-            }
+            const auto& pin = inst.cell->pins[k];
+            int idx = cell->pinIndex(pin.name);
+            if (idx < 0 || cell->pins[idx].dir != pin.dir)
+                throw std::runtime_error("hold repair: incompatible corner pin " + cell->name + "/" + pin.name);
+            nets[idx] = inst.pin_net[k];
+        }
+        inst.pin_net = std::move(nets);
+        inst.cell = cell;
+    }
+    Slacks result;
+    for (const auto& ep : analyzeNetlistTiming(nl, corner, sdc, {0}).endpoints) {
+        if (ep.max != late) continue;
+        auto entry = result.emplace(Check{ep.pin, ep.check, ep.edge}, ep.slack);
+        entry.first->second = std::min(entry.first->second, ep.slack);
+    }
+    return result;
+}
+
+double worstEdge(const Slacks& slacks, const std::string& pin, const char* check) {
+    double worst = std::numeric_limits<double>::infinity();
+    for (auto edge : {RISE, FALL}) {
+        auto it = slacks.find({pin, check, edge});
+        if (it != slacks.end()) worst = std::min(worst, it->second);
+    }
+    return worst;
+}
+
+bool preservesChecks(const Slacks& before, const Slacks& after) {
+    for (const auto& [key, slack] : before) {
+        auto trial = after.find(key);
+        if (trial == after.end() || trial->second + 1e-6 < std::min(0.0, slack)) return false;
+    }
+    return true;
+}
+} // namespace
+
+HoldRepairReport repairFastHoldPaths(CellNetlist& nl, const Library& lib, const Library& fast, const Library& slow,
+                        const Sdc& constraints) {
+    if (constraints.clocks.size() != 1 || constraints.clocks.front().sources.empty())
+        throw std::runtime_error("hold repair requires one clock bound to a port");
+    const LibCell* delay = lib.find("sg13cmos5l_dlygate4sd3_1");
+    int in_pin, out_pin;
+    if (!findBufferPins(delay, in_pin, out_pin)) throw std::runtime_error("hold repair: missing IHP delay cell");
+    auto hold = cornerSlacks(nl, fast, constraints, false);
+    auto setup = cornerSlacks(nl, slow, constraints, true);
+    struct Sink { size_t inst, pin; std::string name; };
+    std::vector<Sink> sinks;
+    for (size_t i = 0; i < nl.instances.size(); ++i) {
+        const auto& inst = nl.instances[i];
+        if (!inst.cell->is_sequential) continue;
+        for (size_t k = 0; k < inst.pin_net.size(); ++k) {
+            auto name = inst.name + "/" + inst.cell->pins[k].name;
+            if (std::isfinite(worstEdge(hold, name, "hold"))) sinks.push_back({i, k, name});
         }
     }
-
-    // Memoized min hops from any sequential output (Q) and max combinational hops from any startpoint
-    constexpr int kInf = 1000000;
-    std::vector<int> min_seq(n_nets, -1), max_comb(n_nets, -1);
-    std::vector<uint8_t> active(n_nets, 0);
-
-    std::function<std::pair<int, int>(int)> analyzeNet = [&](int n) -> std::pair<int, int> {
-        if (n < 2 || static_cast<size_t>(n) >= n_nets) return {kInf, 0};
-        if (min_seq[n] >= 0) return {min_seq[n], max_comb[n]};
-        if (active[n]) return {kInf, 0};
-        int drv = net_driver_inst[n];
-        if (drv < 0) {
-            min_seq[n] = kInf;
-            max_comb[n] = 0;
-            return {kInf, 0};
-        }
-        const auto& inst = nl.instances[drv];
-        if (inst.cell->is_sequential || inst.cell->is_macro) {
-            min_seq[n] = 0;
-            max_comb[n] = 0;
-            return {0, 0};
-        }
-        active[n] = 1;
-        int best_min = kInf, worst_max = 0;
-        for (size_t k = 0; k < inst.pin_net.size(); ++k) {
-            if (inst.cell->pins[k].dir == PinDir::OUTPUT) continue;
-            auto [mn, mx] = analyzeNet(inst.pin_net[k]);
-            if (mn < kInf) best_min = std::min(best_min, mn + 1);
-            worst_max = std::max(worst_max, mx + 1);
-        }
-        active[n] = 0;
-        min_seq[n] = best_min;
-        max_comb[n] = worst_max;
-        return {best_min, worst_max};
+    auto eligible = [&](const Sink& sink) {
+        double margin = worstEdge(setup, sink.name, "setup");
+        return worstEdge(hold, sink.name, "hold") < 0 && std::isfinite(margin) && margin > 0;
     };
-
-    BufferNames names(nl);
     int added = 0;
-    for (size_t i = 0; i < n_insts; ++i) {
-        if (!nl.instances[i].cell->is_sequential) continue;
-        const LibCell* cell = nl.instances[i].cell;
-        for (size_t k = 0; k < cell->pins.size(); ++k) {
-            const LibPin& pin = cell->pins[k];
-            if (pin.dir != PinDir::INPUT || pin.is_clock) continue;
-            // Only buffer synchronous data inputs (D), not async reset/set pins
-            bool is_data_pin = false;
-            for (const LibArc& arc : cell->arcs) {
-                if (arc.to_pin == static_cast<int>(k) &&
-                    (arc.type == TimingType::SETUP_RISING || arc.type == TimingType::SETUP_FALLING ||
-                     arc.type == TimingType::HOLD_RISING || arc.type == TimingType::HOLD_FALLING)) {
-                    is_data_pin = true;
+    // Try independent endpoints together. Split a rejected batch so one
+    // setup-limited endpoint cannot veto repairs elsewhere in the design.
+    for (int round = 0; round < 8; ++round) {
+        std::vector<Sink> todo;
+        std::copy_if(sinks.begin(), sinks.end(), std::back_inserter(todo), eligible);
+        int previous = added;
+        std::function<void(size_t, size_t)> attempt = [&](size_t begin, size_t end) {
+            // Earlier batches can change the loading of a shared driver.
+            while (begin < end && !eligible(todo[begin])) ++begin;
+            if (begin == end) return;
+            for (size_t j = begin + 1; j < end; ++j) {
+                if (!eligible(todo[j])) {
+                    attempt(begin, j);
+                    attempt(j + 1, end);
+                    return;
                 }
             }
-            if (!is_data_pin) continue;
-            int net = nl.instances[i].pin_net[k];
-            auto [mn, mx] = analyzeNet(net);
-            if (mn <= max_short_hops && mx <= max_setup_hops) {
-                // Use full delay cell on shallow-setup flops (mx <= 10), lighter buf_1 on deeper paths
-                bool use_dly = (mx <= 10);
-                const LibCell* chosen = use_dly ? dly : fast_buf;
-                int cp_in = use_dly ? in_pin : fin_pin;
-                int cp_out = use_dly ? out_pin : fout_pin;
-                std::string bname = names.reserve("hold_buf_" + std::to_string(added++));
-                int dnet = nl.addNet(bname + "_n");
-                CellNetlist::Instance binst;
-                binst.name = bname;
-                binst.cell = chosen;
-                binst.pin_net.assign(chosen->pins.size(), -1);
-                binst.pin_net[cp_in] = net;
-                binst.pin_net[cp_out] = dnet;
-                nl.instances[i].pin_net[k] = dnet;
-                nl.instances.push_back(std::move(binst));
+            CellNetlist trial = nl;
+            BufferNames names(trial);
+            for (size_t j = begin; j < end; ++j) {
+                const auto& sink = todo[j];
+                std::string name = names.reserve("hold_buf_" + std::to_string(added + j - begin));
+                int net = trial.addNet(name + "_n");
+                auto& input = trial.instances[sink.inst].pin_net[sink.pin];
+                CellNetlist::Instance inst{name, delay, std::vector<int>(delay->pins.size(), -1)};
+                inst.pin_net[in_pin] = input;
+                inst.pin_net[out_pin] = net;
+                input = net;
+                trial.instances.push_back(std::move(inst));
             }
-        }
+            auto candidate_hold = cornerSlacks(trial, fast, constraints, false);
+            bool improves = preservesChecks(hold, candidate_hold);
+            for (size_t j = begin; improves && j < end; ++j)
+                improves = worstEdge(candidate_hold, todo[j].name, "hold") >
+                           worstEdge(hold, todo[j].name, "hold") + 1e-6;
+            if (improves) {
+                auto candidate_setup = cornerSlacks(trial, slow, constraints, true);
+                if (preservesChecks(setup, candidate_setup)) {
+                    nl = std::move(trial);
+                    hold = std::move(candidate_hold);
+                    setup = std::move(candidate_setup);
+                    added += static_cast<int>(end - begin);
+                    return;
+                }
+            }
+            if (end - begin > 1) {
+                size_t mid = begin + (end - begin) / 2;
+                attempt(begin, mid);
+                attempt(mid, end);
+            }
+        };
+        if (!todo.empty()) attempt(0, todo.size());
+        if (added == previous) break;
     }
-    return added;
+    int remaining = std::count_if(sinks.begin(), sinks.end(), [&](const Sink& sink) {
+        return worstEdge(hold, sink.name, "hold") < 0;
+    });
+    return {added, remaining};
 }

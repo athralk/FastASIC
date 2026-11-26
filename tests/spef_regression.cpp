@@ -89,6 +89,21 @@ int main(int argc, char** argv) {
             throw std::runtime_error("physical metal patch did not connect its contacts");
         }
 
+        {
+            std::ofstream out(path);
+            out << "*C_UNIT 1 FF\n*R_UNIT 1 OHM\n"
+                   "*D_NET a 110\n*CONN\n*P src I\n*P dst O\n*CAP\n"
+                   "1 src a:1 100\n2 dst b:1 10\n*RES\n1 src a:1 1000\n2 a:1 dst 2000\n*END\n"
+                   "*D_NET b 10\n*CAP\n1 b:1 dst 10\n*END\n";
+        }
+        auto coupled = readSpef(path);
+        const auto& a_net = coupled.nets.at("a");
+        near(a_net.wire_cap_ff, 210, "intra-net coupling loads both local endpoints");
+        near(a_net.pin_elmore_ps.at("dst"), 130, "coupling delay uses downstream endpoints");
+        near(coupled.nets.at("b").wire_cap_ff, 10, "external coupling loads only the local endpoint");
+        if (a_net.node_cap_ff.size() != 3 || coupled.nets.at("b").node_cap_ff.size() != 1)
+            throw std::runtime_error("foreign coupling node included in local RC graph");
+
         // The SPEF has only wire RC. SDC and Liberty loads must participate in
         // the wire delay, including independent rise/fall and early/late values.
         {
@@ -106,6 +121,32 @@ int main(int argc, char** argv) {
         auto result = analyzeNetlistTiming(f.nl, lib, sdc, opt);
         if (result.endpoints.size() != 4) throw std::runtime_error("missing port endpoints");
         for (const auto& ep : result.endpoints) near(ep.arrival, 100, "SDC load wire delay");
+
+        {
+            std::ofstream out(path);
+            out << "library(test) { slew_lower_threshold_pct_rise: 10; slew_upper_threshold_pct_rise: 70;"
+                   " slew_lower_threshold_pct_fall: 25; slew_upper_threshold_pct_fall: 90;"
+                   " slew_derate_from_library: 0.5; }";
+        }
+        lib = readLiberty(path);
+        auto derated = parseSdc("create_clock -name vclk -period [expr {1e+1}]\n"
+                                "set_input_delay 0 -clock vclk [all_inputs]\n"
+                                "set_output_delay 0 -clock vclk [all_outputs]\n"
+                                "set_load [expr {1e-1 * (+2 / 2)}] [all_outputs]\n"
+                                "set_timing_derate -net_delay -data -rise -late 1.25\n"
+                                "set_timing_derate -net_delay -fall -early 0.75\n"
+                                "set_timing_derate -late 3 [get_cells some_cell]\n", 1000, 1000);
+        if (derated.warnings.size() != 1) throw std::runtime_error("scoped derate must be diagnosed");
+        auto derated_result = analyzeNetlistTiming(f.nl, lib, derated, opt);
+        for (const auto& ep : derated_result.endpoints) {
+            double expected = ep.edge == RISE && ep.max ? 125 : ep.edge == FALL && !ep.max ? 75 : 100;
+            near(ep.arrival, expected, "global SDC derate selection");
+        }
+        for (const auto* p : {&derated_result.setup_paths.at(0), &derated_result.hold_paths.at(0)}) {
+            const auto& pt = p->points.back();
+            double ratio = pt.edge == RISE ? 0.9 / 0.3 : 0.9 / 0.25;
+            near(pt.slew, 100 * std::log(ratio) / 0.5, "Liberty threshold-specific wire slew");
+        }
 
         {
             std::ofstream out(path);

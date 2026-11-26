@@ -1,4 +1,5 @@
 #pragma once
+#include <array>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -71,6 +72,12 @@ struct LibBus {
     std::vector<int> pins;   // pin indices in from..to order (most significant first for [9:0])
 };
 
+// Fractions and single-pole RC step-response factors, indexed by rise / fall.
+struct SlewThresholds {
+    std::array<double, 2> fraction{0.6, 0.6};
+    std::array<double, 2> wire_factor{1.3862943611198906, 1.3862943611198906};
+};
+
 struct LibCell {
     std::string name;
     double area = 0;          // um^2
@@ -85,7 +92,7 @@ struct LibCell {
     // Fraction of a full rail-to-rail transition that this cell's slew numbers measure:
     // (slew_upper - slew_lower threshold) / slew_derate_from_library of its library (0.6 for 20-80%).
     // Slews are converted with it when a net connects cells from different libraries.
-    double slew_fraction = 0.6;
+    SlewThresholds slew_thresholds;
     int address_width = 0, word_width = 0;
 
     int pinIndex(const std::string& name) const;
@@ -99,7 +106,7 @@ struct Library {
     double nom_voltage = 0, nom_temperature = 0;
     std::string leakage_unit;
     double time_unit_ps = 1000;   // the library's time unit (SDC files use it too)
-    double slew_fraction = 0.6;   // see LibCell::slew_fraction; SDC slews are in this library's terms
+    SlewThresholds slew_thresholds;   // see LibCell::slew_thresholds; SDC slews are in this library's terms
     double cap_unit_ff = 1000;    // the library's capacitance unit
     std::vector<LibCell> cells;
     std::unordered_map<std::string, int> cell_index;

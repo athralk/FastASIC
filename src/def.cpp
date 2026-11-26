@@ -17,8 +17,6 @@ std::string defName(const std::string& s) {
     return out;
 }
 
-const char* kPowerNets[2] = {"VDD", "VSS"};
-
 } // namespace
 
 void writeDef(std::ostream& out, const Floorplan& fp, const CellNetlist& nl, const Lef& lef, const DrouteResult* routes) {
@@ -93,13 +91,23 @@ void writeDef(std::ostream& out, const Floorplan& fp, const CellNetlist& nl, con
     for (int net = 0; net < 2; ++net) {
         const FpSpecialWire* w = power_pin[net];
         if (!w) continue;
-        Dbu len = std::min<Dbu>(std::max(std::llabs(w->x1 - w->x0), std::llabs(w->y1 - w->y0)), 10 * w->width);
-        bool hor = w->y0 == w->y1;
-        Dbu cx = hor ? std::min(w->x0, w->x1) + len / 2 : w->x0, cy = hor ? w->y0 : std::min(w->y0, w->y1) + len / 2;
-        Dbu hx = hor ? len / 2 : w->width / 2, hy = hor ? w->width / 2 : len / 2;
-        out << "  - " << kPowerNets[net] << " + NET " << kPowerNets[net] << " + SPECIAL + DIRECTION INOUT + USE " << (net == 0 ? "POWER" : "GROUND") << "\n"
-            << "    + PORT + LAYER " << lef.layers[w->layer].name << " ( " << -hx << " " << -hy << " ) ( " << hx << " " << hy << " )\n"
-            << "    + FIXED ( " << cx << " " << cy << " ) N ;\n";
+        out << "  - " << fp.supplies[net] << " + NET " << fp.supplies[net] << " + SPECIAL + DIRECTION INOUT + USE " << (net == 0 ? "POWER" : "GROUND");
+        if (fp.tt_tile) {
+            for (const FpSpecialWire& stripe : fp.special) {
+                if (stripe.net != net || stripe.layer != top_layer || stripe.via >= 0) continue;
+                Dbu half = stripe.width / 2;
+                out << "\n    + PORT + LAYER " << lef.layers[top_layer].name << " ( " << -half << " 0 ) ( " << half << " " << stripe.y1 - stripe.y0
+                    << " ) + FIXED ( " << stripe.x0 << " " << stripe.y0 << " ) N";
+            }
+        } else {
+            Dbu len = std::min<Dbu>(std::max(std::llabs(w->x1 - w->x0), std::llabs(w->y1 - w->y0)), 10 * w->width);
+            bool hor = w->y0 == w->y1;
+            Dbu cx = hor ? std::min(w->x0, w->x1) + len / 2 : w->x0, cy = hor ? w->y0 : std::min(w->y0, w->y1) + len / 2;
+            Dbu hx = hor ? len / 2 : w->width / 2, hy = hor ? w->width / 2 : len / 2;
+            out << "\n    + PORT + LAYER " << lef.layers[w->layer].name << " ( " << -hx << " " << -hy << " ) ( " << hx << " " << hy << " )"
+                << "\n    + FIXED ( " << cx << " " << cy << " ) N";
+        }
+        out << " ;\n";
     }
     for (const FpPin& p : fp.pins) {
         const auto& pb = nl.port_bits[p.port_bit];
@@ -107,7 +115,7 @@ void writeDef(std::ostream& out, const Floorplan& fp, const CellNetlist& nl, con
             << " + USE SIGNAL\n"
             << "    + PORT + LAYER " << lef.layers[p.layer].name << " ( " << p.shape.x0 << " " << p.shape.y0 << " ) ( " << p.shape.x1 << " " << p.shape.y1
             << " )\n"
-            << "    + PLACED ( " << p.x << " " << p.y << " ) N ;\n";
+            << (fp.tt_tile ? "    + FIXED ( " : "    + PLACED ( ") << p.x << " " << p.y << " ) N ;\n";
     }
     out << "END PINS\n\n";
 
@@ -126,7 +134,7 @@ void writeDef(std::ostream& out, const Floorplan& fp, const CellNetlist& nl, con
     }
     out << "SPECIALNETS 2 ;\n";
     for (int net = 0; net < 2; ++net) {
-        out << "  - " << kPowerNets[net];
+        out << "  - " << fp.supplies[net];
         for (const auto& name : supply_pins[net]) out << " ( * " << defName(name) << " )";
         out << " + USE " << (net == 0 ? "POWER" : "GROUND");
         bool first = true;

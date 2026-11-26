@@ -4,6 +4,7 @@
 #include <ostream>
 #include <string>
 #include <vector>
+#include <unordered_set>
 
 // A flat gate-level netlist of library cells: what Yosys / OpenLane write after synthesis
 // and what static timing analysis works on. Everything is bit-level and index-based.
@@ -15,6 +16,7 @@ struct CellNetlist {
         std::string name;   // "a" or "a[3]"
         bool is_input = true;
         int net = -1;
+        bool bus_bit = false;
     };
     struct Instance {
         std::string name;
@@ -26,6 +28,7 @@ struct CellNetlist {
     std::vector<PortInfo> ports;        // as declared, for writing the netlist back out
     std::vector<PortBit> port_bits;
     std::vector<std::string> net_names;
+    std::unordered_set<int> vector_nets;  // true bit-selects in the structural Verilog
     std::vector<Instance> instances;
 
     CellNetlist() : net_names{"1'b0", "1'b1"} {}

@@ -15,6 +15,7 @@ struct FloorplanOptions {
     std::string site = "CoreSite";
     std::string tracks_file;      // LibreLane tracks.info ("layer X|Y offset pitch"); empty: from the LEF
     std::string pin_hlayer = "Metal3", pin_vlayer = "Metal2";   // pins on left/right, top/bottom edges
+    std::string tt_template;      // IHP Tiny Tapeout tile DEF (die, signal pins and supply names)
     bool pdn = true;
     std::string rail_layer = "Metal1", strap_layer = "Metal4", top_layer = "TopMetal1";
     double rail_width = 0.44;     // um, Metal1 follow-pin rails along the rows
@@ -85,6 +86,8 @@ struct Floorplan {
     std::string design;
     int dbu = 1000;
     Rect die, core;
+    std::string supplies[2] = {"VDD", "VSS"};
+    bool tt_tile = false;
     const LefSite* site = nullptr;
     std::vector<FpRow> rows;
     std::vector<FpTracks> tracks;

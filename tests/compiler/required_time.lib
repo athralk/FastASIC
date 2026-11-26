@@ -1,0 +1,69 @@
+library(required_time) {
+  time_unit : "1ps";
+  cell (sg13cmos5l_inv_1) {
+    area : 1;
+    pin (A) { direction : input; }
+    pin (Y) {
+      direction : output; function : "!A";
+      timing () {
+        related_pin : "A";
+        cell_rise (scalar) { values ("2"); }
+        cell_fall (scalar) { values ("2"); }
+      }
+    }
+  }
+  cell (sg13cmos5l_nand2_1) {
+    area : 1;
+    pin (A) { direction : input; }
+    pin (B) { direction : input; }
+    pin (Y) {
+      direction : output; function : "!(A & B)";
+      timing () {
+        related_pin : "A";
+        cell_rise (scalar) { values ("5"); }
+        cell_fall (scalar) { values ("5"); }
+      }
+      timing () {
+        related_pin : "B";
+        cell_rise (scalar) { values ("5"); }
+        cell_fall (scalar) { values ("5"); }
+      }
+    }
+  }
+  cell (XOR_FAST) {
+    area : 3;
+    pin (A) { direction : input; }
+    pin (B) { direction : input; }
+    pin (Y) {
+      direction : output; function : "A ^ B";
+      timing () {
+        related_pin : "A";
+        cell_rise (scalar) { values ("3"); }
+        cell_fall (scalar) { values ("3"); }
+      }
+      timing () {
+        related_pin : "B";
+        cell_rise (scalar) { values ("3"); }
+        cell_fall (scalar) { values ("3"); }
+      }
+    }
+  }
+  cell (XOR_SMALL) {
+    area : 1;
+    pin (A) { direction : input; }
+    pin (B) { direction : input; }
+    pin (Y) {
+      direction : output; function : "A ^ B";
+      timing () {
+        related_pin : "A";
+        cell_rise (scalar) { values ("20"); }
+        cell_fall (scalar) { values ("20"); }
+      }
+      timing () {
+        related_pin : "B";
+        cell_rise (scalar) { values ("20"); }
+        cell_fall (scalar) { values ("20"); }
+      }
+    }
+  }
+}

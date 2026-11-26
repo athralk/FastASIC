@@ -65,7 +65,7 @@ class Timer {
     // connects a driver and a load from different libraries the slew is converted by the ratio
     // of their slew fractions, as OpenSTA's DelayCalcBase::thresholdAdjust does; ports use the
     // main (first) library.
-    std::vector<double> slew_frac;
+    std::vector<SlewThresholds> thresholds;
 
     // Timing state, indexed node * 2 + edge
     std::vector<double> arr_max, arr_min, slew_max, slew_min;
@@ -130,9 +130,9 @@ class Timer {
         }
         res.cells = nl.instances.size();
         res.nets = nl.netCount();
-        slew_frac.assign(nodes.size(), lib.slew_fraction);
+        thresholds.assign(nodes.size(), lib.slew_thresholds);
         for (size_t n = 0; n < nodes.size(); ++n) {
-            if (nodes[n].inst >= 0) slew_frac[n] = nl.instances[nodes[n].inst].cell->slew_fraction;
+            if (nodes[n].inst >= 0) thresholds[n] = nl.instances[nodes[n].inst].cell->slew_thresholds;
         }
 
         size_t n_nodes = nodes.size();
@@ -418,6 +418,9 @@ class Timer {
                 double dmax = 0, smax = transition, dmin = 0, smin = transition;
                 drivingCell(p, e, net_cap[pb.net][e * 2 + 0], dmax, smax);
                 drivingCell(p, e, net_cap[pb.net][e * 2 + 1], dmin, smin);
+                // The external driver's load-dependent delay is a net delay at the port.
+                dmax *= sdc.derates.get(DerateType::Net, false, e, true);
+                dmin *= sdc.derates.get(DerateType::Net, false, e, false);
                 double base = edgeTime(RISE);
                 set(static_cast<int>(p), e, has_max ? base + d_max + dmax : -kInf, has_min ? base + d_min + dmin : kInf, smax, smin);
             }
@@ -440,14 +443,15 @@ class Timer {
                 if (node.net <= CellNetlist::kConst1) continue;
                 int d = net_driver[node.net];
                 if (d < 0) continue;
-                double convert = slew_frac[n] / slew_frac[d];   // 1 unless the libraries differ
                 for (Edge e : kEdges) {
                     size_t i = static_cast<size_t>(n) * 2 + e, j = static_cast<size_t>(d) * 2 + e;
                     double dmax = wire_delay[n][e * 2], dmin = wire_delay[n][e * 2 + 1];
-                    arr_max[i] = arr_max[j] > -kInf ? arr_max[j] + dmax : -kInf;
-                    arr_min[i] = arr_min[j] < kInf ? arr_min[j] + dmin : kInf;
-                    slew_max[i] = std::hypot(slew_max[j], 2.2 * dmax) * convert;
-                    slew_min[i] = slew_min[j] < kInf ? std::hypot(slew_min[j], 2.2 * dmin) * convert : kInf;
+                    double convert = thresholds[n].fraction[e] / thresholds[d].fraction[e];
+                    double factor = thresholds[n].wire_factor[e];
+                    arr_max[i] = arr_max[j] > -kInf ? arr_max[j] + dmax * sdc.derates.get(DerateType::Net, clock_net[n], e, true) : -kInf;
+                    arr_min[i] = arr_min[j] < kInf ? arr_min[j] + dmin * sdc.derates.get(DerateType::Net, clock_net[n], e, false) : kInf;
+                    slew_max[i] = std::hypot(slew_max[j] * convert, factor * dmax);
+                    slew_min[i] = slew_min[j] < kInf ? std::hypot(slew_min[j] * convert, factor * dmin) : kInf;
                     pred_max[i] = pred_min[i] = static_cast<int>(j);
                 }
                 continue;
@@ -474,7 +478,7 @@ class Timer {
                         if (reach_max) {
                             args.output_cap = cap[out * 2 + 0];
                             args.input_transition = slew_max[fi];
-                            double t = arr_max[fi] + dt.lookup(args);
+                            double t = arr_max[fi] + dt.lookup(args) * sdc.derates.get(DerateType::Cell, clock_net[n], out, true);
                             if (t > arr_max[oi]) {
                                 arr_max[oi] = t;
                                 pred_max[oi] = static_cast<int>(fi);
@@ -484,7 +488,7 @@ class Timer {
                         if (reach_min) {
                             args.output_cap = cap[out * 2 + 1];
                             args.input_transition = slew_min[fi];
-                            double t = arr_min[fi] + dt.lookup(args);
+                            double t = arr_min[fi] + dt.lookup(args) * sdc.derates.get(DerateType::Cell, clock_net[n], out, false);
                             if (t < arr_min[oi]) {
                                 arr_min[oi] = t;
                                 pred_min[oi] = static_cast<int>(fi);
@@ -544,7 +548,7 @@ class Timer {
                         if (arr_max[di] == -kInf) continue;
                         args.constrained_transition = slew_max[di];
                         args.related_transition = slew_min[ci];
-                        double margin = table.lookup(args);
+                        double margin = table.lookup(args) * sdc.derates.get(DerateType::Check, false, e, max);
                         double edge0 = phaseEdge(c, ce);
                         double edge = setupEdge(edge0, launchEdge(static_cast<int>(di), pred_max));
                         double capture = arr_min[ci] - edge0 + edge;
@@ -556,7 +560,7 @@ class Timer {
                         if (arr_min[di] == kInf) continue;
                         args.constrained_transition = slew_min[di];
                         args.related_transition = slew_max[ci];
-                        double margin = table.lookup(args);
+                        double margin = table.lookup(args) * sdc.derates.get(DerateType::Check, false, e, max);
                         double edge0 = phaseEdge(c, ce);
                         double edge = holdEdge(edge0, launchEdge(static_cast<int>(di), pred_min));
                         double capture = arr_max[ci] - edge0 + edge;
@@ -673,6 +677,10 @@ public:
         std::map<std::pair<int, bool>, double> worst;
         res.wns_setup = res.wns_hold = kInf;
         for (const Candidate& c : cands) {
+            if (c.max && clock) {
+                double window = c.clock_time - launchEdge(c.node * 2 + c.edge, pred_max);
+                if (window > 0) res.min_period = std::max(res.min_period, clock->period * (1 - c.slack / window));
+            }
             auto key = std::make_pair(c.node, c.max);
             auto it = worst.find(key);
             if (it == worst.end() || c.slack < it->second) worst[key] = c.slack;
@@ -690,7 +698,6 @@ public:
                 if (slack < 0) { res.tns_hold += slack; res.hold_violations++; }
             }
         }
-        if (res.setup_endpoints && clock) res.min_period = clock->period - res.wns_setup;
 
         // Clock skew over register clock pins
         double lo = kInf, hi = -kInf;
@@ -698,9 +705,13 @@ public:
             if (!checks[n].empty()) {
                 for (const Arc& a : checks[n]) {
                     if (!clock_net[a.from]) continue;
-                    size_t ci = static_cast<size_t>(a.from) * 2 + RISE;
-                    lo = std::min(lo, arr_min[ci]);
-                    hi = std::max(hi, arr_max[ci]);
+                    TimingType type = a.arc->type;
+                    Edge edge = (type == TimingType::SETUP_FALLING || type == TimingType::HOLD_FALLING ||
+                                 type == TimingType::RECOVERY_FALLING || type == TimingType::REMOVAL_FALLING) ? FALL : RISE;
+                    size_t ci = static_cast<size_t>(a.from) * 2 + edge;
+                    double phase = phaseEdge(a.from, edge);
+                    lo = std::min(lo, arr_min[ci] - phase);
+                    hi = std::max(hi, arr_max[ci] - phase);
                 }
             }
         }

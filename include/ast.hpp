@@ -23,13 +23,15 @@ enum class ExprKind {
 struct Expr;
 using ExprPtr = std::shared_ptr<Expr>;
 
+enum class LiteralDigit { Known, X, Z };
+
 struct Expr {
     ExprKind kind;
     size_t line = 0;
     std::string op;              // UNARY, BINARY, INDEXED_PART_SELECT
     std::string name;            // IDENTIFIER and the selects: the signal being read
     std::vector<bool> bits;      // NUMBER: value, least significant bit first; bits.size() is the width
-    std::vector<bool> wild;      // NUMBER: x / z / ? digits (only meaningful in casez / casex labels)
+    std::vector<LiteralDigit> wild;      // NUMBER: x / z / ? digits (only meaningful in casez / casex labels)
     bool is_signed = false;      // NUMBER: 8'sd5, or an unsized decimal (Verilog integers are signed)
     std::vector<ExprPtr> operands;
     ExprPtr word;                // mem[word][bit] / mem[word][msb:lsb]: the memory word index

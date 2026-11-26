@@ -5,6 +5,7 @@
 #include <fstream>
 #include <iomanip>
 #include <limits>
+#include <numeric>
 #include <queue>
 #include <set>
 #include <tuple>
@@ -27,11 +28,14 @@ std::string unescapeName(const std::string& s) {
     return out;
 }
 
-std::string spefEscape(const std::string& s) {
+std::string spefEscape(const std::string& s, bool bus_bit = false) {
+    // Escape punctuation in the declared identifier, but preserve its bit-select suffix.
+    size_t end = bus_bit ? s.rfind('[') : s.size();
     std::string out;
     out.reserve(s.size() + 4);
-    for (char c : s) {
-        if (c == '[' || c == ']' || c == '$' || c == '.' || c == '/') out.push_back('\\');
+    for (size_t i = 0; i < s.size(); ++i) {
+        char c = s[i];
+        if (i < end && (c == '[' || c == ']' || c == '$' || c == '.' || c == '/')) out.push_back('\\');
         out.push_back(c);
     }
     return out;
@@ -131,7 +135,7 @@ void writeSpef(std::ostream& out, const Floorplan& fp, const CellNetlist& nl, co
         Dbu cy = p.y + (p.shape.y0 + p.shape.y1) / 2;
         Rect r = p.shape;
         r.x0 += p.x; r.x1 += p.x; r.y0 += p.y; r.y1 += p.y;
-        net_pins[pb.net].push_back({spefEscape(pb.name), pb.name, true, pb.is_input, cx, cy, {{p.layer, r}}});
+        net_pins[pb.net].push_back({spefEscape(pb.name, pb.bus_bit), pb.name, true, pb.is_input, cx, cy, {{p.layer, r}}});
     }
     for (const FpComponent& c : fp.components) {
         if (!c.placed) continue;
@@ -233,7 +237,7 @@ void writeSpef(std::ostream& out, const Floorplan& fp, const CellNetlist& nl, co
             std::string name;
         };
         std::vector<NodeInfo> nodes;
-        std::string net_esc = spefEscape(nl.net_names[net]);
+        std::string net_esc = spefEscape(nl.net_names[net], nl.vector_nets.count(net));
 
         auto getNode = [&](int l, Dbu x, Dbu y) -> int {
             PtKey k{l, x, y};
@@ -452,7 +456,9 @@ SpefData readSpef(const std::string& path) {
     enum Section { TOP, NAME_MAP, D_NET_CONN, D_NET_CAP, D_NET_RES };
     Section sec = TOP;
 
-    std::string cur_net;
+    std::string cur_net, raw_net_prefix;
+    std::vector<std::tuple<std::string, std::string, double>> coupling;
+    bool has_cap_records = false;
     double cur_total_cap_ff = 0.0;
     std::unordered_map<std::string, int> rc_node_id;
     std::vector<double> rc_cap_ff;
@@ -473,10 +479,20 @@ SpefData readSpef(const std::string& path) {
     auto finishNet = [&]() {
         if (cur_net.empty()) return;
         NetParasitics np;
-        np.wire_cap_ff = cur_total_cap_ff;
+        // Ground each coupling endpoint belonging to this D_NET. RES and CONN may
+        // follow CAP, so resolve ownership after the complete network has been read.
+        for (const auto& [left, right, cap] : coupling) {
+            for (const auto* name : {&left, &right}) {
+                if (rc_node_id.count(*name) || name->compare(0, raw_net_prefix.size(), raw_net_prefix) == 0) {
+                    int node = getRcNode(*name);
+                    rc_cap_ff[node] += cap;
+                }
+            }
+        }
+        np.wire_cap_ff = has_cap_records ? std::accumulate(rc_cap_ff.begin(), rc_cap_ff.end(), 0.0) : cur_total_cap_ff;
         np.wire_res_ohm = total_res_ohm;
         // Fallback lumped Elmore delay: 0.5 * R_wire * C_wire * 1e-3 ps
-        np.default_elmore_ps = 0.5 * total_res_ohm * cur_total_cap_ff * 1e-3;
+        np.default_elmore_ps = 0.5 * total_res_ohm * np.wire_cap_ff * 1e-3;
         np.driver_node = driver_node;
         np.node_cap_ff = std::move(rc_cap_ff);
         np.resistors = std::move(rc_resistors);
@@ -485,6 +501,8 @@ SpefData readSpef(const std::string& path) {
         data.nets[cur_net] = std::move(np);
         data.net_count++;
         cur_net.clear();
+        coupling.clear();
+        has_cap_records = false;
         cur_total_cap_ff = 0.0;
         rc_node_id.clear();
         rc_cap_ff.clear();
@@ -533,6 +551,7 @@ SpefData readSpef(const std::string& path) {
             std::string raw_net;
             double cap = 0.0;
             if (ss >> raw_net >> cap) {
+                raw_net_prefix = resolve(raw_net) + delim;
                 cur_net = unescapeName(resolve(raw_net));
                 cur_total_cap_ff = cap * c_to_ff;
             }
@@ -567,15 +586,13 @@ SpefData readSpef(const std::string& path) {
             std::string fourth;
             if (ss >> fourth) {
                 try { val = std::stod(fourth) * c_to_ff; } catch (...) { continue; }
-                int u = getRcNode(resolve(n1));
-                int v = getRcNode(resolve(third));
-                rc_cap_ff[u] += val;
-                rc_cap_ff[v] += val;
+                coupling.emplace_back(resolve(n1), resolve(third), val);
             } else {
                 try { val = std::stod(third) * c_to_ff; } catch (...) { continue; }
                 int u = getRcNode(resolve(n1));
                 rc_cap_ff[u] += val;
             }
+            has_cap_records = true;
         } else if (sec == D_NET_RES) {
             std::string n1, n2;
             double val = 0.0;

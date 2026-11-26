@@ -45,6 +45,14 @@ check() {
     fi
 }
 
+# The only positive AND uses NAND + INV. Both XOR leaves must retain the
+# 3 ps implementation to meet the fastest cover's 10 ps path budget.
+map_tmp=$(mktemp)
+check "inverter-fed output preserves fanin timing during area recovery" 0 "" \
+    bash -c '"$1" -q --map delay --lib "$2/required_time.lib" -o "$3" "$2/required_time.v" &&
+             [ "$(grep -c "^  XOR_FAST " "$3")" = 2 ] && ! grep -q "^  XOR_SMALL " "$3"' _ "$BIN" "$DIR/compiler" "$map_tmp"
+rm -f "$map_tmp"
+
 echo "Pipeline (parse -> map -> optimize, checked for equivalence):"
 check "example.v" 0 "" "$BIN" "$DIR/../example.v"
 for f in "$DIR"/cases/*.v "$DIR"/seq/*.v "$DIR"/hier/*.v "$DIR"/lang/*.v; do
@@ -142,6 +150,8 @@ if [ -f "$PDK_LIB" ] && [ -x "$LSTA" ]; then
             *FAIL*) failed=$((failed + 1)); echo "$line" ;;
         esac
     done < <(bash "$DIR/lsta_golden.sh" "$LSTA")
+    check "hold repair needs a fast violation and sufficient slow setup" 0 "checks passed" \
+        python3 "$DIR/hold_repair.py" "$BIN" "$LSTA"
     tmpnet=$(mktemp)
     "$LSTA" -q -sdc "$DIR/../bench/sta/propagated.sdc" -cts sg13cmos5l_buf_8 -cts_fanout 6 -write "$tmpnet" "$DIR/../bench/sta/netlists/mul16.v" > /dev/null
     check "netlist write + re-read keeps every slack" 0 "setup         -539.10" "$LSTA" -q -sdc "$DIR/../bench/sta/propagated.sdc" "$tmpnet"
@@ -206,6 +216,8 @@ PNR=$(dirname "$BIN")/fastpnr
 echo "Physical design (fastpnr: floorplan, placement, global routing; every result self-checked;"
 echo "OpenROAD also checks the floorplans with FASTASIC_OPENROAD=1, IHP's DRC and LVS decks the routes with FASTASIC_SIGNOFF=1):"
 if [ -f "$PDK_LIB" ] && [ -x "$PNR" ]; then
+    check "routed bus bits, timing derates, RC load and mixed-edge clocks" 0 "ideal skew zero" \
+        python3 "$DIR/compiler/timing_and_layout.py" --bin "$BIN" --lib "$PDK_LIB"
     FP_TMP=$(mktemp -d)
     check "both clock domains get balanced trees" 0 "Clock tree buffers: 4, high-fanout nets buffered: 0" \
         "$BIN" -q --map delay -o "$FP_TMP/domains.v" "$DIR/seq/clock_domains.v"
@@ -216,6 +228,8 @@ if [ -f "$PDK_LIB" ] && [ -x "$PNR" ]; then
     check "an inaccessible two-pin net is an open" 1 "1 nets not fully connected" \
         "$PNR" -droute -lef "$pdk_lef_dir/sg13cmos5l_tech.lef" -lef "$pdk_lef_dir/sg13cmos5l_stdcell.lef" \
         -lef "$DIR/pnr/inaccessible.lef" "$DIR/pnr/inaccessible.v"
+    check "TT template pins, die boundary and Metal4 supplies" 0 "tile interface verified" \
+        python3 "$DIR/pnr/tile_interface.py" "$PNR"
     # a 52k-cell design: 8 copies of mac32 (generated, too large to keep in the repo)
     python3 "$DIR/../tools/replicate_netlist.py" "$DIR/../bench/sta/netlists/mac32.v" 8 > "$FP_TMP/mac32_x8.v"
     for f in "$DIR"/../bench/sta/netlists/*.v "$FP_TMP/mac32_x8.v"; do
@@ -283,6 +297,9 @@ fi
 
 echo "Co-simulation against iverilog (RTL operators vs our netlist; exhaustive up to 16 input bits):"
 if command -v iverilog > /dev/null && command -v yosys > /dev/null; then
+    for f in wide_product constant_width case_labels loop_clobber func_int; do
+        check "$f: RTL vs generated gates" 0 "PASS" bash "$DIR/cosim.sh" "$BIN" "$DIR/compiler/$f.v" 384
+    done
     for f in "$DIR"/lang/*.v "$DIR"/cases/adder8.v "$DIR"/cases/compare12.v "$DIR"/cases/alu4.v; do
         check "$(basename "$f")" 0 "PASS" bash "$DIR/cosim.sh" "$BIN" "$f" 20000
     done

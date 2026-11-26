@@ -2,6 +2,7 @@
 #include <algorithm>
 #include <cctype>
 #include <charconv>
+#include <cmath>
 #include <cstdlib>
 #include <fstream>
 #include <sstream>
@@ -256,7 +257,7 @@ class Converter {
     double cap_scale = 1000;    // fF per library capacitance unit
     std::unordered_map<std::string, Template> templates;
     std::unordered_map<std::string, std::pair<int, int>> types;   // bus types: bit_from, bit_to
-    double slew_fraction = 0.6;
+    SlewThresholds thresholds;
 
     double scaleFor(TableVar v) const {
         return v == TableVar::OUTPUT_CAP ? cap_scale : (v == TableVar::NONE ? 1 : time_scale);
@@ -425,7 +426,7 @@ class Converter {
     LibCell readCell(const Group& g) {
         LibCell cell;
         cell.name = g.args.empty() ? "" : std::string(g.args[0]);
-        cell.slew_fraction = slew_fraction;
+        cell.slew_thresholds = thresholds;
         cell.area = number(g.attr("area"));
         cell.leakage = number(g.attr("cell_leakage_power"));
         std::vector<std::pair<const Group*, int>> timing;
@@ -469,8 +470,15 @@ public:
             return v.empty() ? fallback : number(v);
         };
         double derate = pct("slew_derate_from_library", 1.0);
-        slew_fraction = (pct("slew_upper_threshold_pct_rise", 80) - pct("slew_lower_threshold_pct_rise", 20)) / 100.0 / derate;
-        lib.slew_fraction = slew_fraction;
+        for (int e = 0; e < 2; ++e) {
+            double lo = 0.01 * pct(e ? "slew_lower_threshold_pct_fall" : "slew_lower_threshold_pct_rise", 20);
+            double hi = 0.01 * pct(e ? "slew_upper_threshold_pct_fall" : "slew_upper_threshold_pct_rise", 80);
+            if (!(0 < lo && lo < hi && hi < 1 && derate > 0))
+                throw std::runtime_error("invalid Liberty slew thresholds or slew derate");
+            thresholds.fraction[e] = (hi - lo) / derate;
+            thresholds.wire_factor[e] = std::log(e ? hi / lo : (1 - lo) / (1 - hi)) / derate;
+        }
+        lib.slew_thresholds = thresholds;
         lib.time_unit_ps = time_scale;
         lib.cap_unit_ff = cap_scale;
         lib.nom_voltage = number(root.attr("nom_voltage"));
